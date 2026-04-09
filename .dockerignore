@@ -1,0 +1,8 @@
+target/
+.git/
+.env
+.env.*
+!.env.sample
+.claude/
+*.md
+assets/*.pem
