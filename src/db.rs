@@ -38,6 +38,7 @@ impl Db {
         let migration_files = [
             include_str!("../migrations/001_create_nodes.sql"),
             include_str!("../migrations/002_add_geo_columns.sql"),
+            include_str!("../migrations/003_add_ingress_metadata_url.sql"),
         ];
 
         for file in migration_files {
