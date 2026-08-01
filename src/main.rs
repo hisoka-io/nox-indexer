@@ -136,19 +136,21 @@ async fn spawn_background_tasks(
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
 
-    match chain::initial_chain_sync(state, chain_config).await {
-        Ok(last_block) => {
-            let s = state.clone();
-            let c = chain_config.clone();
-            handles.push(tokio::spawn(
-                async move { chain::chain_event_loop(s, c, last_block).await },
-            ));
+    // Run the initial chain sync inside the spawned task rather than awaiting it
+    // here. The replay covers tens of millions of blocks, and blocking startup on
+    // it meant the HTTP server did not bind until it finished, so the platform
+    // healthcheck timed out and killed the deploy before it could ever serve.
+    let s = state.clone();
+    let c = chain_config.clone();
+    handles.push(tokio::spawn(async move {
+        match chain::initial_chain_sync(&s, &c).await {
+            Ok(last_block) => chain::chain_event_loop(s, c, last_block).await,
+            Err(e) => {
+                tracing::error!("Initial chain sync failed: {e}");
+                tracing::warn!("Continuing without chain discovery — nodes from DB only");
+            }
         }
-        Err(e) => {
-            tracing::error!("Initial chain sync failed: {e}");
-            tracing::warn!("Continuing without chain discovery — nodes from DB only");
-        }
-    }
+    }));
 
     let s = state.clone();
     handles.push(tokio::spawn(async move {
