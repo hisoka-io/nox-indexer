@@ -4,6 +4,7 @@ use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+use crate::node::offsets::{CumulativeMetrics, NodeOffset};
 use crate::state::{NodeState, NodeStatus};
 
 const EMA_ALPHA: f64 = 0.01;
@@ -39,6 +40,7 @@ impl Db {
             include_str!("../migrations/001_create_nodes.sql"),
             include_str!("../migrations/002_add_geo_columns.sql"),
             include_str!("../migrations/003_add_ingress_metadata_url.sql"),
+            include_str!("../migrations/004_metric_offsets.sql"),
         ];
 
         for file in migration_files {
@@ -195,6 +197,75 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Load banked lifetime metric offsets for every known node.
+    ///
+    /// JSONB columns are read as text and decoded here, avoiding a dependency on
+    /// sqlx's `json` feature. A row whose payload fails to decode is skipped with
+    /// a warning rather than aborting startup, so one corrupt row cannot take the
+    /// indexer down.
+    pub async fn load_metric_offsets(&self) -> Result<HashMap<String, NodeOffset>, sqlx::Error> {
+        let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+            "SELECT address, last_node_start_time, offsets::text, last_raw::text
+             FROM node_metric_offsets",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = HashMap::with_capacity(rows.len());
+        for (address, last_node_start_time, offsets, last_raw) in rows {
+            let banked = match serde_json::from_str::<CumulativeMetrics>(&offsets) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Skipping corrupt metric offsets for {address}: {e}");
+                    continue;
+                }
+            };
+            let last_raw = serde_json::from_str::<CumulativeMetrics>(&last_raw).unwrap_or_default();
+            out.insert(
+                address,
+                NodeOffset {
+                    last_node_start_time,
+                    banked,
+                    last_raw,
+                    dirty: false,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// Persist one node's banked offsets. Called on restart detection and on the
+    /// periodic flush, not on every scrape.
+    pub async fn save_metric_offset(
+        &self,
+        address: &str,
+        offset: &NodeOffset,
+        now_ms: i64,
+    ) -> Result<(), sqlx::Error> {
+        let banked = serde_json::to_string(&offset.banked).unwrap_or_else(|_| "{}".to_string());
+        let last_raw = serde_json::to_string(&offset.last_raw).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO node_metric_offsets
+                 (address, last_node_start_time, offsets, last_raw, updated_at_ms)
+             VALUES ($1, $2, $3::jsonb, $4::jsonb, $5)
+             ON CONFLICT (address) DO UPDATE SET
+                 last_node_start_time = EXCLUDED.last_node_start_time,
+                 offsets              = EXCLUDED.offsets,
+                 last_raw             = EXCLUDED.last_raw,
+                 updated_at_ms        = EXCLUDED.updated_at_ms",
+        )
+        .bind(address)
+        .bind(offset.last_node_start_time)
+        .bind(&banked)
+        .bind(&last_raw)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn deregister_node(&self, address: &str) -> Result<(), sqlx::Error> {

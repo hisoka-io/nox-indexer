@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::broadcast::{broadcast_cluster_snapshot, broadcast_event, broadcast_metrics};
 use crate::node::events::IngestEvent;
 use crate::node::metrics::StructuredMetrics;
+use crate::node::offsets::NodeOffset;
 use crate::state::{AppState, NodeStatus, MAX_RECENT_EVENTS};
 
 const UPTIME_CONCURRENCY: usize = 20;
@@ -205,7 +206,8 @@ async fn scrape_node_metrics(
                 match client.get(&metrics_url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<StructuredMetrics>().await {
-                            Ok(parsed) => {
+                            Ok(mut parsed) => {
+                                apply_lifetime_offsets(&state, &node_address, &mut parsed).await;
                                 state.metrics.write().insert(node_address.clone(), parsed.clone());
                                 broadcast_metrics(&state, &node_address, &parsed);
                             }
@@ -227,6 +229,93 @@ async fn scrape_node_metrics(
                     }
                 }
             }
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Fold banked lifetime totals into a freshly scraped reading.
+///
+/// Detects a node restart, banks the previous incarnation's final counters, then
+/// adds the running total onto `parsed` so the dashboard sees a continuous
+/// lifetime figure. The write lock is released before any DB call.
+async fn apply_lifetime_offsets(state: &AppState, address: &str, parsed: &mut StructuredMetrics) {
+    let banked_snapshot = {
+        let mut map = state.metric_offsets.write();
+        let offset = map.entry(address.to_string()).or_default();
+        // Observe the raw reading first; applying before observing would fold
+        // previously banked totals back into last_raw and double-count them.
+        let restarted = offset.observe(parsed);
+        offset.apply(parsed);
+        if restarted {
+            Some(offset.clone())
+        } else {
+            None
+        }
+    };
+
+    let Some(offset) = banked_snapshot else {
+        return;
+    };
+
+    tracing::info!(
+        "Node {address} restarted (incarnation {}); banked lifetime totals \
+         (packets_received={:.0}, uptime_seconds={:.0})",
+        offset.last_node_start_time,
+        offset.banked.packets_received,
+        offset.banked.uptime_seconds,
+    );
+
+    if let Err(e) = state.db.save_metric_offset(address, &offset, now_ms()).await {
+        tracing::warn!("Failed to persist metric offsets for {address}: {e}");
+    } else if let Some(entry) = state.metric_offsets.write().get_mut(address) {
+        entry.dirty = false;
+    }
+}
+
+/// Periodically flush banked totals so an indexer restart loses at most one
+/// interval of in-flight counts rather than the whole current incarnation.
+pub async fn metric_offset_flush_loop(state: AppState, interval_secs: u64) {
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    interval.tick().await; // skip the immediate first tick
+
+    loop {
+        tokio::select! {
+            () = state.shutdown.cancelled() => {
+                flush_dirty_offsets(&state).await;
+                tracing::info!("metric_offset_flush_loop: shutting down");
+                return;
+            }
+            _ = interval.tick() => {}
+        }
+
+        flush_dirty_offsets(&state).await;
+    }
+}
+
+async fn flush_dirty_offsets(state: &AppState) {
+    let pending: Vec<(String, NodeOffset)> = {
+        let map = state.metric_offsets.read();
+        map.iter()
+            .filter(|(_, o)| o.dirty || !o.last_raw.is_zero())
+            .map(|(a, o)| (a.clone(), o.clone()))
+            .collect()
+    };
+
+    let ts = now_ms();
+    for (address, offset) in pending {
+        if let Err(e) = state.db.save_metric_offset(&address, &offset, ts).await {
+            tracing::warn!("Failed to flush metric offsets for {address}: {e}");
+            continue;
+        }
+        if let Some(entry) = state.metric_offsets.write().get_mut(&address) {
+            entry.dirty = false;
         }
     }
 }

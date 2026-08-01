@@ -40,6 +40,9 @@ where
 pub struct StructuredMetrics {
     pub active_peers: f64,
     pub uptime_seconds: f64,
+    /// Unix epoch seconds at which the node process started. Changes on restart,
+    /// which is how lifetime metric offsets detect a new incarnation.
+    pub node_start_time: f64,
     pub health_status: f64,
     pub packets_received: f64,
     pub packets_forwarded: f64,

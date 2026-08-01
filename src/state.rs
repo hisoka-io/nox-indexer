@@ -187,4 +187,7 @@ pub struct AppState {
     pub db: Db,
     pub geo: Option<crate::geo::GeoIp>,
     pub shutdown: CancellationToken,
+    /// Per-node banked lifetime totals, so container restarts do not reset the
+    /// cumulative figures shown on the dashboard.
+    pub metric_offsets: Arc<RwLock<HashMap<String, crate::node::offsets::NodeOffset>>>,
 }

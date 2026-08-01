@@ -18,6 +18,10 @@ use tower_http::cors::CorsLayer;
 use config::{Args, NetworkConfig};
 use state::AppState;
 
+/// How often banked lifetime metric offsets are flushed to Postgres. Restart
+/// detection persists immediately; this bounds what an indexer crash can lose.
+const METRIC_OFFSET_FLUSH_SECS: u64 = 60;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -95,6 +99,19 @@ async fn init_state(args: &Args, net_config: &NetworkConfig) -> (AppState, Optio
 
     let (tx, _rx) = tokio::sync::broadcast::channel(256);
 
+    let metric_offsets = match db.load_metric_offsets().await {
+        Ok(offsets) => {
+            if !offsets.is_empty() {
+                tracing::info!("Loaded lifetime metric offsets for {} nodes", offsets.len());
+            }
+            offsets
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load metric offsets, starting empty: {e}");
+            HashMap::new()
+        }
+    };
+
     let state = AppState {
         nodes: Arc::new(RwLock::new(persisted_nodes)),
         metrics: Arc::new(RwLock::new(HashMap::new())),
@@ -106,6 +123,7 @@ async fn init_state(args: &Args, net_config: &NetworkConfig) -> (AppState, Optio
         db,
         geo,
         shutdown: CancellationToken::new(),
+        metric_offsets: Arc::new(RwLock::new(metric_offsets)),
     };
 
     (state, resume_block)
@@ -145,6 +163,11 @@ async fn spawn_background_tasks(
     let s = state.clone();
     handles.push(tokio::spawn(async move {
         node::subscriber::periodic_topology_sync(s).await
+    }));
+
+    let s = state.clone();
+    handles.push(tokio::spawn(async move {
+        node::subscriber::metric_offset_flush_loop(s, METRIC_OFFSET_FLUSH_SECS).await
     }));
 
     handles
