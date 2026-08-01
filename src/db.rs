@@ -60,9 +60,12 @@ impl Db {
 
     pub async fn load_all_nodes(&self) -> Result<HashMap<String, NodeState>, sqlx::Error> {
         let rows = sqlx::query_as::<_, NodeRow>(
+            // Every NodeRow field must appear here: a missing column makes FromRow
+            // fail to decode, which previously surfaced as a silent "0 nodes from
+            // DB" and forced a full chain replay on every boot.
             "SELECT address, id, admin_port, ingress_port, p2p_addr,
-                    sphinx_key, admin_url, status, role, layer,
-                    latitude, longitude
+                    sphinx_key, admin_url, ingress_url, metadata_url,
+                    status, role, layer, latitude, longitude
              FROM nodes
              WHERE status != 'deregistered'",
         )

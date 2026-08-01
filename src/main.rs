@@ -83,7 +83,12 @@ async fn init_state(args: &Args, net_config: &NetworkConfig) -> (AppState, Optio
         }
     };
 
-    let persisted_nodes = db.load_all_nodes().await.unwrap_or_default();
+    // Never swallow this error: an empty node set silently degrades into a full
+    // chain replay, which is slow enough to look like an outage.
+    let persisted_nodes = db.load_all_nodes().await.unwrap_or_else(|e| {
+        tracing::error!("Failed to load nodes from DB: {e}");
+        HashMap::new()
+    });
     tracing::info!("Loaded {} nodes from DB", persisted_nodes.len());
 
     let resume_block = db.get_last_chain_block().await.unwrap_or(None);
