@@ -55,6 +55,12 @@ pub struct NetworkConfig {
 
 impl NetworkConfig {
     pub fn resolve(args: &Args) -> Result<Self, String> {
+        if args.from_block == 0 {
+            return Err(
+                "FROM_BLOCK must be the exact NoxRegistry deployment block; refusing an unbounded replay"
+                    .to_string(),
+            );
+        }
         let (default_rpc, poll_secs) = match args.network.as_str() {
             "localtestnet" => (Some("http://127.0.0.1:8545".to_string()), 6u64),
             "testnet" | "mainnet" => (None, 12u64),
@@ -76,5 +82,29 @@ impl NetworkConfig {
             poll_interval_secs: poll_secs,
             from_block: args.from_block,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_start_block_is_rejected_before_an_unbounded_replay() {
+        let args = Args {
+            network: "localtestnet".to_string(),
+            registry_address: "0x1111111111111111111111111111111111111111".to_string(),
+            rpc_url: None,
+            from_block: 0,
+            port: 4_000,
+            database_url: "postgres://localhost/indexer".to_string(),
+            uptime_check_interval: 60,
+            geoip_db_path: "./assets/GeoLite2-City.mmdb".to_string(),
+        };
+
+        assert!(matches!(
+            NetworkConfig::resolve(&args),
+            Err(message) if message.contains("FROM_BLOCK")
+        ));
     }
 }

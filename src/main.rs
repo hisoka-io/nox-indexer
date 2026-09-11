@@ -35,21 +35,20 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let (state, resume_block) = init_state(&args, &net_config).await;
-
     let chain_config = Arc::new(
         chain::ChainConfig::new(
             &net_config.rpc_url,
             &args.registry_address,
             net_config.poll_interval_secs,
             net_config.from_block,
-            resume_block,
         )
         .unwrap_or_else(|e| {
             eprintln!("Chain config error: {e}");
             std::process::exit(1);
         }),
     );
+
+    let state = init_state(&args, &net_config, chain_config.clone()).await;
 
     let handles = spawn_background_tasks(&state, &chain_config, args.uptime_check_interval).await;
 
@@ -64,7 +63,11 @@ async fn main() {
     tracing::info!("Shutdown complete");
 }
 
-async fn init_state(args: &Args, net_config: &NetworkConfig) -> (AppState, Option<u64>) {
+async fn init_state(
+    args: &Args,
+    net_config: &NetworkConfig,
+    chain: Arc<chain::ChainConfig>,
+) -> AppState {
     let db = db::Db::connect(&args.database_url)
         .await
         .unwrap_or_else(|e| {
@@ -91,15 +94,18 @@ async fn init_state(args: &Args, net_config: &NetworkConfig) -> (AppState, Optio
     });
     tracing::info!("Loaded {} nodes from DB", persisted_nodes.len());
 
-    let resume_block = db.get_last_chain_block().await.unwrap_or(None);
-    if let Some(block) = resume_block {
+    let last_persisted_block = db.get_last_chain_block().await.unwrap_or(None);
+    if let Some(block) = last_persisted_block {
         tracing::info!(
             "DB has last_chain_block={block} (from_block={}, delta={})",
             net_config.from_block,
             block.saturating_sub(net_config.from_block)
         );
     } else {
-        tracing::info!("Fresh start: no last_chain_block in DB, will scan from from_block={}", net_config.from_block);
+        tracing::info!(
+            "Fresh start: no last_chain_block in DB, will scan from from_block={}",
+            net_config.from_block
+        );
     }
 
     let (tx, _rx) = tokio::sync::broadcast::channel(256);
@@ -117,7 +123,8 @@ async fn init_state(args: &Args, net_config: &NetworkConfig) -> (AppState, Optio
         }
     };
 
-    let state = AppState {
+    AppState {
+        chain,
         nodes: Arc::new(RwLock::new(persisted_nodes)),
         metrics: Arc::new(RwLock::new(HashMap::new())),
         recent_events: Arc::new(RwLock::new(VecDeque::with_capacity(
@@ -129,9 +136,7 @@ async fn init_state(args: &Args, net_config: &NetworkConfig) -> (AppState, Optio
         geo,
         shutdown: CancellationToken::new(),
         metric_offsets: Arc::new(RwLock::new(metric_offsets)),
-    };
-
-    (state, resume_block)
+    }
 }
 
 async fn spawn_background_tasks(
@@ -201,7 +206,10 @@ async fn serve_http(state: AppState, port: u16, net_config: &NetworkConfig, args
             axum::routing::get(api::handle_get_reputation),
         )
         .route("/v1/live", axum::routing::get(api::handle_ws_upgrade))
-        .route("/seed/topology", axum::routing::get(api::handle_seed_topology))
+        .route(
+            "/seed/topology",
+            axum::routing::get(api::handle_seed_topology),
+        )
         .route("/healthz", axum::routing::get(api::handle_healthz))
         .layer(cors)
         .with_state(state.clone());

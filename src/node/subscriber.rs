@@ -272,7 +272,11 @@ async fn apply_lifetime_offsets(state: &AppState, address: &str, parsed: &mut St
         offset.banked.uptime_seconds,
     );
 
-    if let Err(e) = state.db.save_metric_offset(address, &offset, now_ms()).await {
+    if let Err(e) = state
+        .db
+        .save_metric_offset(address, &offset, now_ms())
+        .await
+    {
         tracing::warn!("Failed to persist metric offsets for {address}: {e}");
     } else if let Some(entry) = state.metric_offsets.write().get_mut(address) {
         entry.dirty = false;
@@ -520,7 +524,10 @@ async fn apply_status_change(state: &AppState, address: &str, reachable: bool) -
         if node.status != NodeStatus::Deregistered && node.status != new_status {
             tracing::info!(
                 "Node {} ({}) status: {} -> {}",
-                node.id, node.address, node.status, new_status
+                node.id,
+                node.address,
+                node.status,
+                new_status
             );
             node.status = new_status;
             return true;

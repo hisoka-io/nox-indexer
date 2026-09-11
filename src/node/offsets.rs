@@ -59,8 +59,9 @@ cumulative_metrics!(
     cover_drop_generated,
     sphinx_errors,
     replay_duplicate,
-    cumulative_revenue_usd,
+    cumulative_authorized_revenue_usd,
     cumulative_cost_usd,
+    cumulative_maximum_cost_usd,
     exit_payloads_dispatched,
     exit_echo,
     exit_http,
@@ -179,6 +180,28 @@ mod tests {
         off.apply(&mut live);
         assert_eq!(live.packets_received, 910.0);
         assert_eq!(live.uptime_seconds, 100.0);
+    }
+
+    #[test]
+    fn restart_banks_maximum_authorized_cost() {
+        let mut offset = NodeOffset::default();
+        offset.observe(&StructuredMetrics {
+            node_start_time: 1_000.0,
+            cumulative_maximum_cost_usd: 1.2,
+            ..Default::default()
+        });
+        assert!(offset.observe(&StructuredMetrics {
+            node_start_time: 2_000.0,
+            cumulative_maximum_cost_usd: 0.3,
+            ..Default::default()
+        }));
+
+        let mut live = StructuredMetrics {
+            cumulative_maximum_cost_usd: 0.3,
+            ..Default::default()
+        };
+        offset.apply(&mut live);
+        assert_eq!(live.cumulative_maximum_cost_usd, 1.5);
     }
 
     #[test]

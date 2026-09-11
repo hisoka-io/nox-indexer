@@ -1,3 +1,4 @@
+use axum::http::StatusCode;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -5,12 +6,44 @@ use axum::{
     },
     response::IntoResponse,
 };
-use ethers::utils::{hex, keccak256};
+use serde::Serialize;
 use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::broadcast::cluster_snapshot_json;
 use crate::state::{AppState, NodeState, NodeStatus};
+
+#[derive(Serialize)]
+struct SeedTopologyNode {
+    address: String,
+    sphinx_key: String,
+    url: String,
+    stake: String,
+    last_seen: u64,
+    is_privileged: bool,
+    layer: u8,
+    role: u8,
+    ingress_url: String,
+    metadata_url: String,
+}
+
+#[derive(Serialize)]
+struct SeedLiveness {
+    address: String,
+    status: NodeStatus,
+    observed_at_unix: u64,
+}
+
+#[derive(Serialize)]
+struct SeedTopologySnapshot {
+    schema_version: u8,
+    nodes: Vec<SeedTopologyNode>,
+    fingerprint: String,
+    timestamp: u64,
+    block_number: u64,
+    pow_difficulty: u32,
+    liveness: Vec<SeedLiveness>,
+}
 
 pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse {
     match state.db.ping().await {
@@ -86,72 +119,132 @@ pub async fn handle_ws_upgrade(
     ws.on_upgrade(|socket| handle_ws_connection(socket, state))
 }
 
-/// Serve the network topology for SDK seed discovery.
-///
-/// Returns the same JSON format as a nox node's GET /topology endpoint,
-/// filtered to only include online nodes with valid sphinx keys.
-/// The fingerprint is XOR(keccak256(address)) matching NoxRegistry.sol.
 pub async fn handle_seed_topology(State(state): State<AppState>) -> impl IntoResponse {
-    let nodes = state.nodes.read();
-
-    let online_nodes: Vec<serde_json::Value> = nodes
-        .values()
-        .filter(|n| n.status == NodeStatus::Online && !n.sphinx_key.is_empty())
-        .map(|n| {
-            let ingress_url = if n.ingress_url.is_empty() {
-                derive_ingress_url(&n.p2p_addr, n.ingress_port)
-            } else {
-                n.ingress_url.clone()
-            };
-            json!({
-                "address": n.address,
-                "sphinx_key": n.sphinx_key,
-                "url": n.p2p_addr,
-                "stake": "0",
-                "last_seen": 0,
-                "is_privileged": true,
-                "layer": n.layer,
-                "role": n.role,
-                "ingress_url": ingress_url,
-                "metadata_url": n.metadata_url
-            })
-        })
-        .collect();
-
-    let mut fingerprint = [0u8; 32];
-    for n in nodes.values() {
-        if n.status == NodeStatus::Online && !n.sphinx_key.is_empty() {
-            let addr_clean = n.address.strip_prefix("0x").unwrap_or(&n.address);
-            if let Ok(addr_bytes) = hex::decode(addr_clean) {
-                let hash = keccak256(&addr_bytes);
-                for i in 0..32 {
-                    fingerprint[i] ^= hash[i];
-                }
-            }
+    match build_seed_topology(&state).await {
+        Ok(snapshot) => (StatusCode::OK, axum::Json(json!(snapshot))).into_response(),
+        Err(error) => {
+            tracing::error!("Seed topology unavailable: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({ "error": "chain-verified topology unavailable" })),
+            )
+                .into_response()
         }
     }
-
-    let fp_hex = hex::encode(fingerprint); // lowercase hex, 64 chars
-
-    axum::Json(json!({
-        "nodes": online_nodes,
-        "fingerprint": fp_hex
-    }))
 }
 
-fn derive_ingress_url(p2p_addr: &str, ingress_port: u16) -> String {
-    let ip = p2p_addr
-        .split('/')
-        .nth(2)
-        .unwrap_or("0.0.0.0");
-    format!("http://{}:{}", ip, ingress_port)
+async fn build_seed_topology(state: &AppState) -> Result<SeedTopologySnapshot, String> {
+    let block_number = state
+        .db
+        .get_last_chain_block()
+        .await
+        .map_err(|error| format!("load processed chain block: {error}"))?
+        .filter(|block| *block > 0)
+        .ok_or_else(|| "no processed chain block".to_string())?;
+    let observed_at: std::collections::HashMap<String, u64> = state
+        .db
+        .load_liveness_observed_at()
+        .await
+        .map_err(|error| format!("load liveness observations: {error}"))?
+        .into_iter()
+        .map(|(address, observed)| (address.to_lowercase(), observed))
+        .collect();
+    let statuses: std::collections::BTreeMap<String, NodeStatus> = state
+        .nodes
+        .read()
+        .values()
+        .filter(|node| node.status != NodeStatus::Deregistered)
+        .map(|node| (node.address.to_lowercase(), node.status.clone()))
+        .collect();
+    if statuses.is_empty() {
+        return Err("no replayed registered members are available".to_string());
+    }
+    let member_addresses: Vec<String> = statuses.keys().cloned().collect();
+    let (members, fingerprint) = state
+        .chain
+        .pinned_topology_members(&member_addresses, block_number)
+        .await?;
+    if members.len() != statuses.len() {
+        return Err("pinned member count differs from replayed member set".to_string());
+    }
+
+    let now_unix = u64::try_from(chrono::Utc::now().timestamp())
+        .map_err(|_| "system time is before Unix epoch".to_string())?;
+    assemble_seed_topology(
+        members,
+        fingerprint,
+        statuses,
+        observed_at,
+        block_number,
+        now_unix,
+    )
+}
+
+fn assemble_seed_topology(
+    members: Vec<crate::chain::PinnedTopologyNode>,
+    fingerprint: String,
+    statuses: std::collections::BTreeMap<String, NodeStatus>,
+    observed_at: std::collections::HashMap<String, u64>,
+    block_number: u64,
+    now_unix: u64,
+) -> Result<SeedTopologySnapshot, String> {
+    if members.len() != statuses.len() {
+        return Err("pinned member count differs from replayed member set".to_string());
+    }
+    if members
+        .windows(2)
+        .any(|pair| pair[0].address >= pair[1].address)
+    {
+        return Err("pinned members are not in canonical address order".to_string());
+    }
+    let mut liveness = Vec::with_capacity(members.len());
+    let mut nodes = Vec::with_capacity(members.len());
+    for member in members {
+        let status = statuses.get(&member.address).cloned().ok_or_else(|| {
+            format!(
+                "pinned member {} is absent from replay state",
+                member.address
+            )
+        })?;
+        let observation = observed_at.get(&member.address).copied().unwrap_or(0);
+        liveness.push(SeedLiveness {
+            address: member.address.clone(),
+            status,
+            observed_at_unix: observation,
+        });
+        nodes.push(SeedTopologyNode {
+            address: member.address,
+            sphinx_key: member.sphinx_key,
+            url: member.url,
+            stake: member.stake,
+            last_seen: observation,
+            is_privileged: member.is_privileged,
+            layer: member.layer,
+            role: member.role,
+            ingress_url: member.ingress_url,
+            metadata_url: member.metadata_url,
+        });
+    }
+    Ok(SeedTopologySnapshot {
+        schema_version: 2,
+        nodes,
+        fingerprint,
+        timestamp: now_unix,
+        block_number,
+        pow_difficulty: 0,
+        liveness,
+    })
 }
 
 async fn handle_ws_connection(mut socket: WebSocket, state: AppState) {
     let mut rx = state.tx.subscribe();
 
     let nodes: Vec<NodeState> = state.nodes.read().values().cloned().collect();
-    if socket.send(Message::Text(cluster_snapshot_json(&nodes))).await.is_err() {
+    if socket
+        .send(Message::Text(cluster_snapshot_json(&nodes)))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -165,7 +258,11 @@ async fn handle_ws_connection(mut socket: WebSocket, state: AppState) {
             Err(RecvError::Lagged(n)) => {
                 tracing::warn!("WebSocket client lagged by {n} messages, re-sending snapshot");
                 let nodes: Vec<NodeState> = state.nodes.read().values().cloned().collect();
-                if socket.send(Message::Text(cluster_snapshot_json(&nodes))).await.is_err() {
+                if socket
+                    .send(Message::Text(cluster_snapshot_json(&nodes)))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -173,5 +270,52 @@ async fn handle_ws_connection(mut socket: WebSocket, state: AppState) {
                 break; // sender dropped, server is shutting down
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::PinnedTopologyNode;
+
+    fn member(address: &str) -> PinnedTopologyNode {
+        PinnedTopologyNode {
+            address: address.to_string(),
+            sphinx_key: "11".repeat(32),
+            url: "/ip4/127.0.0.1/tcp/9000".to_string(),
+            stake: "0".to_string(),
+            is_privileged: true,
+            layer: 0,
+            role: 1,
+            ingress_url: "http://127.0.0.1:9002".to_string(),
+            metadata_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn seed_snapshot_retains_offline_registered_members_as_liveness_only() {
+        let online = "0x1111111111111111111111111111111111111111";
+        let offline = "0x2222222222222222222222222222222222222222";
+        let statuses = std::collections::BTreeMap::from([
+            (online.to_string(), NodeStatus::Online),
+            (offline.to_string(), NodeStatus::Offline),
+        ]);
+        let observed = std::collections::HashMap::from([
+            (online.to_string(), 100_u64),
+            (offline.to_string(), 90_u64),
+        ]);
+
+        let snapshot = assemble_seed_topology(
+            vec![member(online), member(offline)],
+            "00".repeat(32),
+            statuses,
+            observed,
+            7,
+            101,
+        )
+        .expect("complete replay state must produce a seed snapshot");
+
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.liveness[1].status, NodeStatus::Offline);
     }
 }

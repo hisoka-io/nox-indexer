@@ -44,7 +44,11 @@ impl Db {
         ];
 
         for file in migration_files {
-            let stmts: Vec<&str> = file.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
+            let stmts: Vec<&str> = file
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
             for stmt in stmts {
                 sqlx::query(stmt).execute(pool).await?;
             }
@@ -191,6 +195,22 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn load_liveness_observed_at(&self) -> Result<HashMap<String, u64>, sqlx::Error> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT address, last_check_ms FROM node_reputation")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(address, observed_at_ms)| {
+                let observed_at_unix = u64::try_from(observed_at_ms)
+                    .unwrap_or(0)
+                    .saturating_div(1_000);
+                (address, observed_at_unix)
+            })
+            .collect())
     }
 
     pub async fn load_all_uptime_targets(&self) -> Result<Vec<(String, String)>, sqlx::Error> {

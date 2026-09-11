@@ -32,16 +32,23 @@ All options are configurable via env vars or CLI flags. See `.env.sample` for de
 | `ETH_RPC_URL` | RPC endpoint | Yes (testnet/mainnet) |
 | `DATABASE_URL` | Postgres connection string | Yes |
 | `NETWORK` | `localtestnet`, `testnet`, or `mainnet` | No |
-| `FROM_BLOCK` | Contract deployment block (skips genesis scan) | No |
+| `FROM_BLOCK` | Exact current NoxRegistry deployment block | Yes |
 
 ## API
 
 ```
 GET  /v1/state        nodes + metrics + events + reputation
 GET  /v1/reputation   uptime rankings
+GET  /seed/topology   chain-pinned SDK topology snapshot
 GET  /healthz         returns 200 if db is up
 WS   /v1/live         pushes CLUSTER / METRICS / EVENT messages
 ```
+
+`/seed/topology` returns schema version 2. Its `nodes` array contains every registered member replayed from
+the configured deployment block, with profiles read at one processed chain block. `liveness` is a separate
+online/offline observation for the same complete member set. The endpoint returns 503 when replayed addresses
+cannot prove the registry count and fingerprint at that block; database rows alone are never used as topology
+authority.
 
 ## Docker
 

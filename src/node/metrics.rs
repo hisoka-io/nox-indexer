@@ -57,8 +57,10 @@ pub struct StructuredMetrics {
     pub cover_drop_degraded: bool,
     pub sphinx_errors: f64,
     pub replay_duplicate: f64,
-    pub cumulative_revenue_usd: f64,
+    pub cumulative_authorized_revenue_usd: f64,
+    /// Planned initial transaction cost. The exporter retains this legacy JSON key.
     pub cumulative_cost_usd: f64,
+    pub cumulative_maximum_cost_usd: f64,
     pub exit_payloads_dispatched: f64,
     pub latency_p50: f64,
     pub latency_p95: f64,
@@ -81,4 +83,29 @@ pub struct StructuredMetrics {
 
     pub egress_forwarded: f64,
     pub egress_exited: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StructuredMetrics;
+
+    #[test]
+    fn paid_economics_schema_matches_node_exporter() {
+        let metrics: StructuredMetrics = serde_json::from_str(
+            r#"{
+                "cumulativeAuthorizedRevenueUsd": 2.5,
+                "cumulativeCostUsd": 1.0,
+                "cumulativeMaximumCostUsd": 1.2,
+                "profitableCount": 7,
+                "unprofitableCount": 3
+            }"#,
+        )
+        .expect("node metrics fixture must decode");
+
+        assert_eq!(metrics.cumulative_authorized_revenue_usd, 2.5);
+        assert_eq!(metrics.cumulative_cost_usd, 1.0);
+        assert_eq!(metrics.cumulative_maximum_cost_usd, 1.2);
+        assert_eq!(metrics.profitable_count, 7.0);
+        assert_eq!(metrics.unprofitable_count, 3.0);
+    }
 }

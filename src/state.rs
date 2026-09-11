@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 /// Role 1 (Relay): layer = SHA256(address)[0] % 2 (0 or 1)
 /// Role 2 (Exit): layer = 2 (always)
 /// Role 3 (Full): layer = SHA256(address)[0] % 3 (0, 1, or 2)
-fn initial_layer_for_role(role: u8, address: &str) -> u8 {
+pub fn primary_layer_for_role(role: u8, address: &str) -> u8 {
     match role {
         2 => 2,
         _ => {
@@ -26,6 +26,7 @@ fn initial_layer_for_role(role: u8, address: &str) -> u8 {
     }
 }
 
+use crate::chain::ChainConfig;
 use crate::chain::{self, OnChainNode};
 use crate::db::{Db, NodeRow};
 use crate::node::metrics::StructuredMetrics;
@@ -157,9 +158,9 @@ impl NodeState {
             admin_url,
             ingress_url: info.ingress_url.clone(),
             metadata_url: info.metadata_url.clone(),
-            status: NodeStatus::Online,
+            status: NodeStatus::Offline,
             role: info.role,
-            layer: initial_layer_for_role(info.role, &info.address),
+            layer: primary_layer_for_role(info.role, &info.address),
             latitude: 0.0,
             longitude: 0.0,
         }
@@ -179,6 +180,7 @@ impl NodeState {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub chain: Arc<ChainConfig>,
     pub nodes: Arc<RwLock<HashMap<String, NodeState>>>,
     pub metrics: Arc<RwLock<HashMap<String, StructuredMetrics>>>,
     pub recent_events: Arc<RwLock<VecDeque<Value>>>,
@@ -190,4 +192,23 @@ pub struct AppState {
     /// Per-node banked lifetime totals, so container restarts do not reset the
     /// cumulative figures shown on the dashboard.
     pub metric_offsets: Arc<RwLock<HashMap<String, crate::node::offsets::NodeOffset>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_discovery_requires_a_liveness_probe_before_marking_a_member_online() {
+        let node = NodeState::from_chain_info(&OnChainNode {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            url: "/ip4/127.0.0.1/tcp/9000".to_string(),
+            ingress_url: "http://127.0.0.1:9002".to_string(),
+            metadata_url: String::new(),
+            sphinx_key: "11".repeat(32),
+            role: 1,
+        });
+
+        assert_eq!(node.status, NodeStatus::Offline);
+    }
 }

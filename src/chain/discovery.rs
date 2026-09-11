@@ -24,6 +24,27 @@ pub async fn initial_chain_sync(state: &AppState, chain: &ChainConfig) -> Result
         registered_addrs.len()
     );
 
+    let registered_members: std::collections::HashSet<String> = registered_addrs
+        .iter()
+        .map(|address| format!("{address:?}").to_lowercase())
+        .collect();
+    let stale_addresses: Vec<String> = state
+        .nodes
+        .read()
+        .keys()
+        .filter(|address| !registered_members.contains(&address.to_lowercase()))
+        .cloned()
+        .collect();
+    for address in stale_addresses {
+        if let Err(error) = state.db.deregister_node(&address).await {
+            tracing::warn!("Failed to prune stale replay row {address}: {error}");
+            continue;
+        }
+        state.nodes.write().remove(&address);
+        state.metrics.write().remove(&address);
+        tracing::info!("Pruned stale replay row {address}");
+    }
+
     let mut count = 0;
     for addr in &registered_addrs {
         match chain.fetch_node_info(*addr).await {
@@ -126,26 +147,11 @@ async fn process_chain_event(state: &AppState, chain: &ChainConfig, event: Chain
         ChainNodeEvent::Registered { address } => {
             let addr_str = format!("{address:?}");
             tracing::info!("Chain: new registration for {addr_str}");
-
-            match chain.fetch_node_info(address).await {
-                Ok(Some(info)) => {
-                    let mut node = NodeState::from_chain_info(&info);
-                    node.apply_geo(&state.geo);
-
-                    if let Err(e) = state.db.upsert_node(&node).await {
-                        tracing::warn!("Failed to persist node {}: {e}", node.address);
-                        return;
-                    }
-                    state.nodes.write().insert(node.address.clone(), node);
-                    broadcast_cluster_snapshot(state);
-                }
-                Ok(None) => {
-                    tracing::warn!("Chain: {addr_str} registered but contract says not registered");
-                }
-                Err(e) => {
-                    tracing::warn!("Chain: failed to fetch info for {addr_str}: {e}");
-                }
-            }
+            refresh_chain_node(state, chain, address).await;
+        }
+        ChainNodeEvent::ProfileChanged { address } => {
+            tracing::info!("Chain: profile changed for {address:?}");
+            refresh_chain_node(state, chain, address).await;
         }
         ChainNodeEvent::Removed { address } => {
             let addr_str = format!("{address:?}");
@@ -178,6 +184,29 @@ async fn process_chain_event(state: &AppState, chain: &ChainConfig, event: Chain
         ChainNodeEvent::Unstaked { address, amount } => {
             let addr_str = format!("{address:?}");
             tracing::info!("Chain: node {addr_str} unstaked {amount}");
+        }
+    }
+}
+
+async fn refresh_chain_node(state: &AppState, chain: &ChainConfig, address: Address) {
+    let address_text = format!("{address:?}");
+    match chain.fetch_node_info(address).await {
+        Ok(Some(info)) => {
+            let mut node = NodeState::from_chain_info(&info);
+            node.apply_geo(&state.geo);
+
+            if let Err(error) = state.db.upsert_node(&node).await {
+                tracing::warn!("Failed to persist node {}: {error}", node.address);
+                return;
+            }
+            state.nodes.write().insert(node.address.clone(), node);
+            broadcast_cluster_snapshot(state);
+        }
+        Ok(None) => {
+            tracing::warn!("Chain: {address_text} is not registered after profile update");
+        }
+        Err(error) => {
+            tracing::warn!("Chain: failed to fetch profile for {address_text}: {error}");
         }
     }
 }
