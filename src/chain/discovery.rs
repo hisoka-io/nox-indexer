@@ -25,7 +25,9 @@ const SYNC_BACKOFF_CAP: Duration = Duration::from_secs(300);
 const VERIFY_INTERVAL: Duration = Duration::from_secs(60);
 /// Consecutive verification failures before the live loop forces a full replay.
 const MISMATCHES_BEFORE_RESYNC: u32 = 2;
-/// Floor between forced full replays, so a persistent mismatch cannot spin.
+/// Floor between two forced full replays, so a persistent mismatch cannot spin.
+/// The first forced replay of the process is not delayed: a missed event should
+/// heal within `MISMATCHES_BEFORE_RESYNC` checks, not after ten minutes.
 const MIN_RESYNC_INTERVAL: Duration = Duration::from_secs(600);
 /// Full replays that disagree with the registry before the replayed set is
 /// served anyway (flagged unverified) instead of retrying again.
@@ -101,6 +103,7 @@ pub async fn run_chain_sync(state: AppState, chain: Arc<ChainConfig>) {
     let mut progress: Option<ReplayProgress> = None;
     let mut force_full = false;
     let mut full_mismatches = 0_u32;
+    let mut last_forced_resync: Option<Instant> = None;
 
     loop {
         if state.shutdown.is_cancelled() {
@@ -114,9 +117,12 @@ pub async fn run_chain_sync(state: AppState, chain: Arc<ChainConfig>) {
             Ok(last_block) => {
                 attempt = 0;
                 full_mismatches = 0;
-                match chain_event_loop(&state, &chain, last_block).await {
+                let resync_not_before =
+                    last_forced_resync.map_or_else(Instant::now, |at| at + MIN_RESYNC_INTERVAL);
+                match chain_event_loop(&state, &chain, last_block, resync_not_before).await {
                     LoopExit::Shutdown => return,
                     LoopExit::Resync(reason) => {
+                        last_forced_resync = Some(Instant::now());
                         tracing::warn!(
                             "Registry membership drifted ({reason}); running a full replay"
                         );
@@ -435,12 +441,21 @@ async fn reconcile_membership(
     Ok(())
 }
 
-async fn chain_event_loop(state: &AppState, chain: &ChainConfig, mut last_block: u64) -> LoopExit {
+/// Whether the live loop should abandon incremental updates for a full replay.
+fn should_force_resync(mismatches: u32, now: Instant, resync_not_before: Instant) -> bool {
+    mismatches >= MISMATCHES_BEFORE_RESYNC && now >= resync_not_before
+}
+
+async fn chain_event_loop(
+    state: &AppState,
+    chain: &ChainConfig,
+    mut last_block: u64,
+    resync_not_before: Instant,
+) -> LoopExit {
     let mut interval = tokio::time::interval(chain.poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_verified = Instant::now();
     let mut mismatches = 0_u32;
-    let started = Instant::now();
 
     loop {
         tokio::select! {
@@ -517,9 +532,7 @@ async fn chain_event_loop(state: &AppState, chain: &ChainConfig, mut last_block:
                 tracing::warn!(
                     "Membership check {mismatches}/{MISMATCHES_BEFORE_RESYNC} at block {last_block} failed: {reason}"
                 );
-                if mismatches >= MISMATCHES_BEFORE_RESYNC
-                    && started.elapsed() >= MIN_RESYNC_INTERVAL
-                {
+                if should_force_resync(mismatches, Instant::now(), resync_not_before) {
                     return LoopExit::Resync(reason);
                 }
             }
@@ -637,6 +650,18 @@ mod tests {
             plan_sync(Some(500), 100, true),
             SyncPlan::Full { from: 100 }
         );
+    }
+
+    #[test]
+    fn the_first_forced_resync_is_not_delayed_but_later_ones_are() {
+        let now = Instant::now();
+        // First drift of the process: resync once enough checks disagree.
+        assert!(!should_force_resync(1, now, now));
+        assert!(should_force_resync(MISMATCHES_BEFORE_RESYNC, now, now));
+        // Right after a forced resync, the floor applies.
+        let floor = now + MIN_RESYNC_INTERVAL;
+        assert!(!should_force_resync(MISMATCHES_BEFORE_RESYNC, now, floor));
+        assert!(should_force_resync(MISMATCHES_BEFORE_RESYNC, floor, floor));
     }
 
     #[test]
