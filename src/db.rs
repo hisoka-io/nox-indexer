@@ -41,6 +41,7 @@ impl Db {
             include_str!("../migrations/002_add_geo_columns.sql"),
             include_str!("../migrations/003_add_ingress_metadata_url.sql"),
             include_str!("../migrations/004_metric_offsets.sql"),
+            include_str!("../migrations/005_registry_checkpoints.sql"),
         ];
 
         for file in migration_files {
@@ -62,17 +63,24 @@ impl Db {
         Ok(())
     }
 
-    pub async fn load_all_nodes(&self) -> Result<HashMap<String, NodeState>, sqlx::Error> {
+    /// Registered nodes last seen in `registry_address`, served until the first
+    /// chain sync of this process completes.
+    pub async fn load_registry_nodes(
+        &self,
+        registry_address: &str,
+    ) -> Result<HashMap<String, NodeState>, sqlx::Error> {
         let rows = sqlx::query_as::<_, NodeRow>(
             // Every NodeRow field must appear here: a missing column makes FromRow
             // fail to decode, which previously surfaced as a silent "0 nodes from
             // DB" and forced a full chain replay on every boot.
             "SELECT address, id, admin_port, ingress_port, p2p_addr,
                     sphinx_key, admin_url, ingress_url, metadata_url,
-                    status, role, layer, latitude, longitude
+                    status, role, layer, latitude, longitude,
+                    frozen, registry_address, chain_id
              FROM nodes
-             WHERE status != 'deregistered'",
+             WHERE status != 'deregistered' AND registry_address = $1",
         )
+        .bind(registry_address.to_lowercase())
         .fetch_all(&self.pool)
         .await?;
 
@@ -89,8 +97,10 @@ impl Db {
         sqlx::query(
             "INSERT INTO nodes (address, id, admin_port, ingress_port, p2p_addr,
                                sphinx_key, admin_url, ingress_url, metadata_url,
-                               status, role, layer, latitude, longitude)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                               status, role, layer, latitude, longitude,
+                               frozen, registry_address, chain_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                     $15, $16, $17)
              ON CONFLICT (address) DO UPDATE SET
                 id = EXCLUDED.id,
                 admin_port = EXCLUDED.admin_port,
@@ -104,7 +114,10 @@ impl Db {
                 role = EXCLUDED.role,
                 layer = EXCLUDED.layer,
                 latitude = EXCLUDED.latitude,
-                longitude = EXCLUDED.longitude",
+                longitude = EXCLUDED.longitude,
+                frozen = EXCLUDED.frozen,
+                registry_address = EXCLUDED.registry_address,
+                chain_id = EXCLUDED.chain_id",
         )
         .bind(&node.address)
         .bind(&node.id)
@@ -120,6 +133,9 @@ impl Db {
         .bind(node.layer as i32)
         .bind(node.latitude)
         .bind(node.longitude)
+        .bind(node.frozen)
+        .bind(&node.registry_address)
+        .bind(i64::try_from(node.chain_id).unwrap_or(i64::MAX))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -155,12 +171,16 @@ impl Db {
         Ok(())
     }
 
+    /// Decay scores of registered nodes that stopped being checked. Deregistered
+    /// nodes keep their final score so a node that re-registers resumes it.
     pub async fn decay_stale_scores(&self, stale_hours: i64) -> Result<u64, sqlx::Error> {
         let cutoff_ms =
             (chrono::Utc::now() - chrono::Duration::hours(stale_hours)).timestamp_millis();
         let result = sqlx::query(
-            "UPDATE node_reputation SET score = score * 0.95
-             WHERE last_check_ms < $1 AND last_check_ms > 0 AND score > 1.0",
+            "UPDATE node_reputation r SET score = r.score * 0.95
+             FROM nodes n
+             WHERE n.address = r.address AND n.status != 'deregistered'
+               AND r.last_check_ms < $1 AND r.last_check_ms > 0 AND r.score > 1.0",
         )
         .bind(cutoff_ms)
         .execute(&self.pool)
@@ -178,7 +198,8 @@ impl Db {
                     n.status
              FROM nodes n
              LEFT JOIN node_reputation r ON n.address = r.address
-             ORDER BY score DESC",
+             WHERE n.status != 'deregistered'
+             ORDER BY score DESC, n.address",
         )
         .fetch_all(&self.pool)
         .await
@@ -299,23 +320,105 @@ impl Db {
         Ok(())
     }
 
-    pub async fn get_last_chain_block(&self) -> Result<Option<u64>, sqlx::Error> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT value FROM indexer_state WHERE key = 'last_chain_block'")
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(v,)| v as u64))
+    /// Mark every registered row outside `keep` as deregistered, whatever
+    /// registry it came from. Returns the addresses that changed.
+    pub async fn deregister_nodes_except(
+        &self,
+        keep: &[String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let keep: Vec<String> = keep.iter().map(|a| a.to_lowercase()).collect();
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "UPDATE nodes SET status = 'deregistered'
+             WHERE status != 'deregistered' AND NOT (lower(address) = ANY($1))
+             RETURNING address",
+        )
+        .bind(&keep)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(address,)| address).collect())
     }
 
-    pub async fn set_last_chain_block(&self, block: u64) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT INTO indexer_state (key, value) VALUES ('last_chain_block', $1)
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    /// Addresses currently registered in `(chain_id, registry_address)`.
+    pub async fn load_registry_member_addresses(
+        &self,
+        chain_id: u64,
+        registry_address: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT address FROM nodes
+             WHERE status != 'deregistered' AND chain_id = $1 AND registry_address = $2",
         )
-        .bind(block as i64)
+        .bind(i64::try_from(chain_id).unwrap_or(i64::MAX))
+        .bind(registry_address.to_lowercase())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(address,)| address).collect())
+    }
+
+    /// Last block fully applied for `(chain_id, registry_address)`.
+    pub async fn get_checkpoint(
+        &self,
+        chain_id: u64,
+        registry_address: &str,
+    ) -> Result<Option<u64>, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT last_block FROM indexer_checkpoints
+             WHERE chain_id = $1 AND registry_address = $2",
+        )
+        .bind(i64::try_from(chain_id).unwrap_or(i64::MAX))
+        .bind(registry_address.to_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(block,)| u64::try_from(block).ok()))
+    }
+
+    pub async fn set_checkpoint(
+        &self,
+        chain_id: u64,
+        registry_address: &str,
+        block: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO indexer_checkpoints (chain_id, registry_address, last_block, updated_at_ms)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (chain_id, registry_address) DO UPDATE SET
+                 last_block = EXCLUDED.last_block,
+                 updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(i64::try_from(chain_id).unwrap_or(i64::MAX))
+        .bind(registry_address.to_lowercase())
+        .bind(i64::try_from(block).unwrap_or(i64::MAX))
+        .bind(chrono::Utc::now().timestamp_millis())
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Persist the network's genesis estimate once: the earliest first uptime
+    /// check implied by `last_check_ms - total_checks * interval`, or now when
+    /// there is no history. Returns the stored value.
+    pub async fn ensure_network_genesis(
+        &self,
+        check_interval_ms: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO indexer_state (key, value)
+             SELECT 'network_genesis_ms', genesis FROM (
+                 SELECT MIN(last_check_ms - total_checks::bigint * $1) AS genesis
+                 FROM node_reputation
+                 WHERE total_checks > 0 AND last_check_ms > 0
+             ) evidence
+             WHERE genesis IS NOT NULL
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .bind(check_interval_ms)
+        .execute(&self.pool)
+        .await?;
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT value FROM indexer_state WHERE key = 'network_genesis_ms'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(value,)| value))
     }
 }
 
@@ -335,4 +438,7 @@ pub(crate) struct NodeRow {
     pub layer: i16,
     pub latitude: f64,
     pub longitude: f64,
+    pub frozen: bool,
+    pub registry_address: String,
+    pub chain_id: i64,
 }

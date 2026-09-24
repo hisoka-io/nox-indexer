@@ -1,14 +1,26 @@
 mod discovery;
+pub mod profile;
+pub mod retry;
+pub mod rpc;
 
-pub use discovery::{chain_event_loop, initial_chain_sync};
+pub use discovery::run_chain_sync;
 
 use ethers::prelude::*;
+use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::utils::keccak256;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use parking_lot::Mutex;
 use std::collections::HashSet;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::state::primary_layer_for_role;
+use profile::{decode_relayer_profile, relayers_calldata, RelayerProfile};
+use retry::{classify_rpc_error, jittered_backoff, AdaptiveChunk, RpcErrorKind};
+use rpc::FailoverHttp;
 
 abigen!(
     NoxRegistryContract,
@@ -26,18 +38,47 @@ abigen!(
         event Unstaked(address indexed relayer, uint256 amount)
         function relayerCount() view returns (uint256)
         function topologyFingerprint() view returns (bytes32)
-        function relayers(address) view returns (bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stakedAmount, uint256 unstakeRequestTime, bool isRegistered, uint8 status, bool frozen)
         function getNodeRole(address _relayer) view returns (uint8)
     ]"#
 );
 
+pub type RegistryProvider = Provider<FailoverHttp>;
+
+/// Attempts per `eth_getLogs` chunk before the error is handed to the caller
+/// (whose own loop keeps its progress and retries with a longer backoff).
+const MAX_CHUNK_ATTEMPTS: u32 = 8;
+const CHUNK_BACKOFF_BASE: Duration = Duration::from_millis(500);
+const CHUNK_BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// Attempts for single view calls (`eth_call`, `eth_blockNumber`).
+const MAX_CALL_ATTEMPTS: u32 = 5;
+/// Concurrent profile reads when pinning a topology snapshot.
+const PROFILE_READ_CONCURRENCY: usize = 4;
+
+/// `eth_getLogs` range tuning.
+#[derive(Debug, Clone, Copy)]
+pub struct LogChunkConfig {
+    pub initial: u64,
+    pub min: u64,
+    pub max: u64,
+}
+
 pub struct ChainConfig {
-    pub provider: Provider<Http>,
+    pub provider: RegistryProvider,
     pub registry_address: Address,
-    pub contract: NoxRegistryContract<Provider<Http>>,
+    /// Lowercase 0x-prefixed registry address, the key used in Postgres.
+    pub registry_hex: String,
+    pub contract: NoxRegistryContract<RegistryProvider>,
     pub poll_interval: Duration,
-    /// Contract deployment block -- always used for initial event replay.
+    /// Contract deployment block: the start of a full replay.
     pub from_block: u64,
+    /// Blocks behind head that are treated as final. Keeps a lagging failover
+    /// endpoint from silently returning an incomplete log range.
+    pub confirmations: u64,
+    pub expected_chain_id: Option<u64>,
+    pub endpoint_labels: Vec<String>,
+    chunk: Mutex<AdaptiveChunk>,
+    /// Cached `eth_chainId`; 0 until first resolved.
+    chain_id: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +89,7 @@ pub struct OnChainNode {
     pub metadata_url: String,
     pub sphinx_key: String,
     pub role: u8,
+    pub frozen: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,25 +103,98 @@ pub struct PinnedTopologyNode {
     pub role: u8,
     pub ingress_url: String,
     pub metadata_url: String,
+    pub frozen: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum ChainNodeEvent {
-    Registered { address: Address },
-    ProfileChanged { address: Address },
-    Removed { address: Address },
-    Unstaked { address: Address, amount: U256 },
+    Registered {
+        address: Address,
+    },
+    ProfileChanged {
+        address: Address,
+    },
+    Removed {
+        address: Address,
+    },
+    /// `executeUnstake` deletes the registration on both registry versions, so
+    /// this is a membership removal, not just a balance change.
+    Unstaked {
+        address: Address,
+        amount: U256,
+    },
+}
+
+/// Apply one event to a replayed membership set. Returns true when membership changed.
+pub fn apply_membership_event(set: &mut HashSet<Address>, event: &ChainNodeEvent) -> bool {
+    match event {
+        ChainNodeEvent::Registered { address } => set.insert(*address),
+        ChainNodeEvent::Removed { address } | ChainNodeEvent::Unstaked { address, .. } => {
+            set.remove(address)
+        }
+        ChainNodeEvent::ProfileChanged { .. } => false,
+    }
+}
+
+/// Retry a fallible RPC operation with jittered exponential backoff.
+pub async fn retry_rpc<T, F, Fut>(
+    label: &str,
+    shutdown: &CancellationToken,
+    operation: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    retry_rpc_attempts(label, shutdown, MAX_CALL_ATTEMPTS, operation).await
+}
+
+/// [`retry_rpc`] with an explicit attempt budget.
+pub async fn retry_rpc_attempts<T, F, Fut>(
+    label: &str,
+    shutdown: &CancellationToken,
+    max_attempts: u32,
+    mut operation: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                attempt += 1;
+                if attempt >= max_attempts {
+                    return Err(format!("{label} failed after {attempt} attempts: {error}"));
+                }
+                let delay = jittered_backoff(attempt, CHUNK_BACKOFF_BASE, CHUNK_BACKOFF_CAP);
+                tracing::warn!(
+                    "{label} failed (attempt {attempt}/{max_attempts}), retrying in {delay:?}: {error}"
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => return Err(format!("{label}: shutting down")),
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
 }
 
 impl ChainConfig {
     pub fn new(
-        rpc_url: &str,
+        rpc_urls: &[String],
         registry_hex: &str,
         poll_secs: u64,
         from_block: u64,
+        confirmations: u64,
+        expected_chain_id: Option<u64>,
+        chunk: LogChunkConfig,
     ) -> Result<Self, String> {
-        let provider = Provider::<Http>::try_from(rpc_url)
-            .map_err(|e| format!("Invalid RPC URL '{rpc_url}': {e}"))?;
+        let transport = FailoverHttp::new(rpc_urls)?;
+        let endpoint_labels = transport.labels();
+        let provider = Provider::new(transport);
 
         let registry_address = registry_hex
             .parse::<Address>()
@@ -90,48 +205,117 @@ impl ChainConfig {
         Ok(Self {
             provider,
             registry_address,
+            registry_hex: format!("{registry_address:?}").to_lowercase(),
             contract,
             poll_interval: Duration::from_secs(poll_secs),
             from_block,
+            confirmations,
+            expected_chain_id,
+            endpoint_labels,
+            chunk: Mutex::new(AdaptiveChunk::new(chunk.initial, chunk.min, chunk.max)),
+            chain_id: AtomicU64::new(0),
         })
     }
 
-    pub async fn scan_events(
+    /// `eth_chainId`, validated against `EXPECTED_CHAIN_ID` when configured.
+    pub async fn chain_id(&self) -> Result<u64, String> {
+        let cached = self.chain_id.load(Ordering::Relaxed);
+        if cached != 0 {
+            return Ok(cached);
+        }
+        let id = self
+            .provider
+            .get_chainid()
+            .await
+            .map_err(|e| format!("Failed to get chain id: {e}"))?
+            .as_u64();
+        if let Some(expected) = self.expected_chain_id {
+            if expected != id {
+                return Err(format!(
+                    "RPC reports chain id {id} but EXPECTED_CHAIN_ID is {expected}"
+                ));
+            }
+        }
+        self.chain_id.store(id, Ordering::Relaxed);
+        Ok(id)
+    }
+
+    /// Latest block minus the configured confirmations.
+    pub async fn safe_head(&self) -> Result<u64, String> {
+        Ok(self
+            .current_block()
+            .await?
+            .saturating_sub(self.confirmations))
+    }
+
+    /// Fetch registry logs starting at `from`, covering as many blocks up to `to`
+    /// as the adaptive chunk allows. Returns the logs and the last block covered.
+    /// Retries with backoff, shrinking the range on range/rate errors.
+    pub async fn fetch_logs_chunk(
         &self,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<Vec<ChainNodeEvent>, String> {
-        const CHUNK_SIZE: u64 = 10_000;
-        let mut events = Vec::new();
-        let mut start = from_block;
-
-        while start <= to_block {
-            let end = (start + CHUNK_SIZE - 1).min(to_block);
-
+        from: u64,
+        to: u64,
+        shutdown: &CancellationToken,
+    ) -> Result<(Vec<Log>, u64), String> {
+        let mut attempt = 0_u32;
+        loop {
+            let span = self.chunk.lock().size();
+            let end = from.saturating_add(span.saturating_sub(1)).min(to);
+            let requested = end - from + 1;
             let filter = Filter::new()
                 .address(self.registry_address)
-                .from_block(start)
+                .from_block(from)
                 .to_block(end);
 
-            let logs = self
-                .provider
-                .get_logs(&filter)
-                .await
-                .map_err(|e| format!("Failed to fetch logs {start}..{end}: {e}"))?;
-
-            for log in logs {
-                if let Some(event) = self.decode_log(&log) {
-                    events.push(event);
+            let error = match self.provider.get_logs(&filter).await {
+                Ok(logs) => {
+                    self.chunk.lock().on_success();
+                    return Ok((logs, end));
                 }
+                Err(error) => error.to_string(),
+            };
+
+            match classify_rpc_error(&error) {
+                RpcErrorKind::RangeTooLarge { hint } => {
+                    let mut chunk = self.chunk.lock();
+                    chunk.on_range_error(requested, hint);
+                    let shrunk = chunk.size() < requested;
+                    drop(chunk);
+                    if shrunk {
+                        tracing::info!(
+                            "eth_getLogs range {requested} rejected, retrying with {} blocks",
+                            self.chunk.lock().size()
+                        );
+                        continue;
+                    }
+                }
+                RpcErrorKind::RateLimited => self.chunk.lock().on_rate_limited(),
+                RpcErrorKind::Transient => {}
             }
 
-            start = end + 1;
+            attempt += 1;
+            if attempt >= MAX_CHUNK_ATTEMPTS {
+                return Err(format!(
+                    "eth_getLogs {from}..{end} failed after {attempt} attempts: {error}"
+                ));
+            }
+            let delay = jittered_backoff(attempt, CHUNK_BACKOFF_BASE, CHUNK_BACKOFF_CAP);
+            tracing::warn!(
+                "eth_getLogs {from}..{end} failed (attempt {attempt}/{MAX_CHUNK_ATTEMPTS}), \
+                 retrying in {delay:?} with {} blocks: {error}",
+                self.chunk.lock().size()
+            );
+            tokio::select! {
+                () = shutdown.cancelled() => return Err("eth_getLogs: shutting down".to_string()),
+                () = tokio::time::sleep(delay) => {}
+            }
         }
-
-        Ok(events)
     }
 
     pub fn decode_log(&self, log: &Log) -> Option<ChainNodeEvent> {
+        if log.address != self.registry_address {
+            return None;
+        }
         macro_rules! try_decode {
             ($filter:ty, $name:expr, $map:expr) => {
                 if let Ok(e) = self.contract.decode_event::<$filter>(
@@ -202,35 +386,83 @@ impl ChainConfig {
         None
     }
 
-    pub async fn fetch_node_info(&self, address: Address) -> Result<Option<OnChainNode>, String> {
-        let info = self
-            .contract
-            .relayers(address)
-            .call()
+    /// `relayers(address)` at `block` (latest when `None`), for either registry layout.
+    pub async fn fetch_profile(
+        &self,
+        address: Address,
+        block: Option<u64>,
+    ) -> Result<RelayerProfile, String> {
+        let tx: TypedTransaction = TransactionRequest::new()
+            .to(self.registry_address)
+            .data(relayers_calldata(address))
+            .into();
+        let block_id = block.map(|n| BlockId::Number(BlockNumber::Number(n.into())));
+        let raw = self
+            .provider
+            .call(&tx, block_id)
             .await
-            .map_err(|e| format!("Failed to call relayers({address:?}): {e}"))?;
+            .map_err(|e| format!("relayers({address:?}) call failed: {e}"))?;
+        decode_relayer_profile(&raw).map_err(|e| format!("relayers({address:?}): {e}"))
+    }
 
-        if !info.6 {
+    async fn fetch_role(&self, address: Address, block: Option<u64>) -> Result<u8, String> {
+        let call = self.contract.get_node_role(address);
+        let call = match block {
+            Some(n) => call.block(BlockId::Number(BlockNumber::Number(n.into()))),
+            None => call,
+        };
+        call.call()
+            .await
+            .map_err(|e| format!("getNodeRole({address:?}): {e}"))
+    }
+
+    pub async fn fetch_node_info(&self, address: Address) -> Result<Option<OnChainNode>, String> {
+        let profile = self.fetch_profile(address, None).await?;
+        if !profile.is_member() {
             return Ok(None);
         }
-
-        let role = self
-            .contract
-            .get_node_role(address)
-            .call()
-            .await
-            .unwrap_or(1);
-
-        let sphinx_key = ethers::utils::hex::encode(info.0);
+        let role = self.fetch_role(address, None).await?;
 
         Ok(Some(OnChainNode {
             address: format!("{address:?}"),
-            url: info.1,
-            ingress_url: info.2,
-            metadata_url: info.3,
-            sphinx_key,
+            url: profile.url,
+            ingress_url: profile.ingress_url,
+            metadata_url: profile.metadata_url,
+            sphinx_key: ethers::utils::hex::encode(profile.sphinx_key),
             role,
+            frozen: profile.frozen,
         }))
+    }
+
+    /// `(relayerCount, topologyFingerprint)` at `block`.
+    pub async fn membership_at(&self, block: u64) -> Result<(U256, [u8; 32]), String> {
+        let block_id = BlockId::Number(BlockNumber::Number(block.into()));
+        let count = self
+            .contract
+            .relayer_count()
+            .block(block_id)
+            .call()
+            .await
+            .map_err(|error| format!("relayerCount at block {block}: {error}"))?;
+        let fingerprint = self
+            .contract
+            .topology_fingerprint()
+            .block(block_id)
+            .call()
+            .await
+            .map_err(|error| format!("topologyFingerprint at block {block}: {error}"))?;
+        Ok((count, fingerprint))
+    }
+
+    /// Check a replayed member set against the registry's count and fingerprint.
+    pub async fn verify_membership(
+        &self,
+        members: &HashSet<Address>,
+        block: u64,
+    ) -> Result<Result<(), String>, String> {
+        let (count, fingerprint) = self.membership_at(block).await?;
+        let addresses: Vec<Address> = members.iter().copied().collect();
+        Ok(validate_pinned_membership(&addresses, count, fingerprint))
     }
 
     pub async fn pinned_topology_members(
@@ -250,66 +482,40 @@ impl ChainConfig {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let block = BlockId::Number(BlockNumber::Number(block_number.into()));
-        let count = self
-            .contract
-            .relayer_count()
-            .block(block)
-            .call()
-            .await
-            .map_err(|error| format!("relayerCount at block {block_number}: {error}"))?;
-        let fingerprint = self
-            .contract
-            .topology_fingerprint()
-            .block(block)
-            .call()
-            .await
-            .map_err(|error| format!("topologyFingerprint at block {block_number}: {error}"))?;
+        let (count, fingerprint) = self.membership_at(block_number).await?;
         validate_pinned_membership(&addresses, count, fingerprint)?;
 
-        let mut nodes = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            let profile = self
-                .contract
-                .relayers(address)
-                .block(block)
-                .call()
-                .await
-                .map_err(|error| {
-                    format!("relayer profile {address:?} at block {block_number}: {error}")
-                })?;
-            if !profile.6 {
-                return Err(format!(
-                    "replayed topology member {address:?} is not registered at block {block_number}"
-                ));
-            }
-            let role = self
-                .contract
-                .get_node_role(address)
-                .block(block)
-                .call()
-                .await
-                .map_err(|error| {
-                    format!("node role {address:?} at block {block_number}: {error}")
-                })?;
-            if !(1..=3).contains(&role) {
-                return Err(format!(
-                    "replayed topology member {address:?} has invalid role {role} at block {block_number}"
-                ));
-            }
-            let address_text = format!("{address:?}").to_lowercase();
-            nodes.push(PinnedTopologyNode {
-                sphinx_key: ethers::utils::hex::encode(profile.0),
-                url: profile.1,
-                ingress_url: profile.2,
-                metadata_url: profile.3,
-                stake: profile.4.to_string(),
-                is_privileged: profile.4.is_zero(),
-                layer: primary_layer_for_role(role, &address_text),
-                role,
-                address: address_text,
-            });
-        }
+        let mut nodes: Vec<PinnedTopologyNode> = stream::iter(addresses)
+            .map(|address| async move {
+                let profile = self.fetch_profile(address, Some(block_number)).await?;
+                if !profile.is_member() {
+                    return Err(format!(
+                        "replayed topology member {address:?} is not registered at block {block_number}"
+                    ));
+                }
+                let role = self.fetch_role(address, Some(block_number)).await?;
+                if !(1..=3).contains(&role) {
+                    return Err(format!(
+                        "replayed topology member {address:?} has invalid role {role} at block {block_number}"
+                    ));
+                }
+                let address_text = format!("{address:?}").to_lowercase();
+                Ok(PinnedTopologyNode {
+                    sphinx_key: ethers::utils::hex::encode(profile.sphinx_key),
+                    url: profile.url,
+                    ingress_url: profile.ingress_url,
+                    metadata_url: profile.metadata_url,
+                    stake: profile.staked_amount.to_string(),
+                    is_privileged: profile.staked_amount.is_zero(),
+                    layer: primary_layer_for_role(role, &address_text),
+                    role,
+                    address: address_text,
+                    frozen: profile.frozen,
+                })
+            })
+            .buffer_unordered(PROFILE_READ_CONCURRENCY)
+            .try_collect()
+            .await?;
         nodes.sort_by(|left, right| left.address.cmp(&right.address));
         Ok((nodes, ethers::utils::hex::encode(fingerprint)))
     }
@@ -320,29 +526,6 @@ impl ChainConfig {
             .await
             .map(|n| n.as_u64())
             .map_err(|e| format!("Failed to get block number: {e}"))
-    }
-
-    pub async fn replay_to_current_set(
-        &self,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<HashSet<Address>, String> {
-        let events = self.scan_events(from_block, to_block).await?;
-        let mut registered = HashSet::new();
-
-        for event in events {
-            match event {
-                ChainNodeEvent::Registered { address } => {
-                    registered.insert(address);
-                }
-                ChainNodeEvent::Removed { address } => {
-                    registered.remove(&address);
-                }
-                ChainNodeEvent::ProfileChanged { .. } | ChainNodeEvent::Unstaked { .. } => {}
-            }
-        }
-
-        Ok(registered)
     }
 }
 

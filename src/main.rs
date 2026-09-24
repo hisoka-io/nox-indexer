@@ -37,10 +37,17 @@ async fn main() {
 
     let chain_config = Arc::new(
         chain::ChainConfig::new(
-            &net_config.rpc_url,
+            &net_config.rpc_urls,
             &args.registry_address,
             net_config.poll_interval_secs,
             net_config.from_block,
+            net_config.confirmations,
+            args.expected_chain_id,
+            chain::LogChunkConfig {
+                initial: args.log_chunk_size,
+                min: args.log_chunk_min,
+                max: args.log_chunk_max,
+            },
         )
         .unwrap_or_else(|e| {
             eprintln!("Chain config error: {e}");
@@ -48,9 +55,9 @@ async fn main() {
         }),
     );
 
-    let state = init_state(&args, &net_config, chain_config.clone()).await;
+    let state = init_state(&args, chain_config.clone()).await;
 
-    let handles = spawn_background_tasks(&state, &chain_config, args.uptime_check_interval).await;
+    let handles = spawn_background_tasks(&state, &chain_config, args.uptime_check_interval);
 
     install_shutdown_handler(state.shutdown.clone());
 
@@ -63,11 +70,7 @@ async fn main() {
     tracing::info!("Shutdown complete");
 }
 
-async fn init_state(
-    args: &Args,
-    net_config: &NetworkConfig,
-    chain: Arc<chain::ChainConfig>,
-) -> AppState {
+async fn init_state(args: &Args, chain: Arc<chain::ChainConfig>) -> AppState {
     let db = db::Db::connect(&args.database_url)
         .await
         .unwrap_or_else(|e| {
@@ -86,27 +89,31 @@ async fn init_state(
         }
     };
 
-    // Never swallow this error: an empty node set silently degrades into a full
-    // chain replay, which is slow enough to look like an outage.
-    let persisted_nodes = db.load_all_nodes().await.unwrap_or_else(|e| {
-        tracing::error!("Failed to load nodes from DB: {e}");
-        HashMap::new()
-    });
-    tracing::info!("Loaded {} nodes from DB", persisted_nodes.len());
+    // Serve the configured registry's last known members until the first chain
+    // sync of this process reconciles them. Rows from other registries are not
+    // loaded: after a registry change they must not appear registered.
+    let persisted_nodes = db
+        .load_registry_nodes(&chain.registry_hex)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to load nodes from DB: {e}");
+            HashMap::new()
+        });
+    tracing::info!(
+        "Loaded {} nodes of registry {} from DB",
+        persisted_nodes.len(),
+        chain.registry_hex
+    );
 
-    let last_persisted_block = db.get_last_chain_block().await.unwrap_or(None);
-    if let Some(block) = last_persisted_block {
-        tracing::info!(
-            "DB has last_chain_block={block} (from_block={}, delta={})",
-            net_config.from_block,
-            block.saturating_sub(net_config.from_block)
-        );
-    } else {
-        tracing::info!(
-            "Fresh start: no last_chain_block in DB, will scan from from_block={}",
-            net_config.from_block
-        );
-    }
+    let check_interval_ms =
+        i64::try_from(args.uptime_check_interval.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    let network_genesis_ms = match db.ensure_network_genesis(check_interval_ms).await {
+        Ok(genesis) => genesis,
+        Err(e) => {
+            tracing::warn!("Failed to load network genesis: {e}");
+            None
+        }
+    };
 
     let (tx, _rx) = tokio::sync::broadcast::channel(256);
 
@@ -123,6 +130,7 @@ async fn init_state(
         }
     };
 
+    let registry_address = chain.registry_hex.clone();
     AppState {
         chain,
         nodes: Arc::new(RwLock::new(persisted_nodes)),
@@ -136,31 +144,34 @@ async fn init_state(
         geo,
         shutdown: CancellationToken::new(),
         metric_offsets: Arc::new(RwLock::new(metric_offsets)),
+        sync: Arc::new(RwLock::new(state::SyncStatus {
+            registry_address,
+            ..Default::default()
+        })),
+        topology_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        seed_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        probe_now: Arc::new(tokio::sync::Notify::new()),
+        network_genesis_ms: Arc::new(RwLock::new(network_genesis_ms)),
     }
 }
 
-async fn spawn_background_tasks(
+fn spawn_background_tasks(
     state: &AppState,
     chain_config: &Arc<chain::ChainConfig>,
     uptime_interval: u64,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
 
-    // Run the initial chain sync inside the spawned task rather than awaiting it
-    // here. The replay covers tens of millions of blocks, and blocking startup on
-    // it meant the HTTP server did not bind until it finished, so the platform
+    // Run the chain sync inside the spawned task rather than awaiting it here.
+    // A replay can cover tens of millions of blocks, and blocking startup on it
+    // meant the HTTP server did not bind until it finished, so the platform
     // healthcheck timed out and killed the deploy before it could ever serve.
+    // The supervisor retries failed syncs forever with backoff.
     let s = state.clone();
     let c = chain_config.clone();
-    handles.push(tokio::spawn(async move {
-        match chain::initial_chain_sync(&s, &c).await {
-            Ok(last_block) => chain::chain_event_loop(s, c, last_block).await,
-            Err(e) => {
-                tracing::error!("Initial chain sync failed: {e}");
-                tracing::warn!("Continuing without chain discovery — nodes from DB only");
-            }
-        }
-    }));
+    handles.push(tokio::spawn(
+        async move { chain::run_chain_sync(s, c).await },
+    ));
 
     let s = state.clone();
     handles.push(tokio::spawn(async move {
@@ -194,6 +205,7 @@ fn install_shutdown_handler(shutdown: CancellationToken) {
 }
 
 async fn serve_http(state: AppState, port: u16, net_config: &NetworkConfig, args: &Args) {
+    let chain = state.chain.clone();
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
@@ -224,8 +236,13 @@ async fn serve_http(state: AppState, port: u16, net_config: &NetworkConfig, args
 
     tracing::info!("Indexer listening on http://{addr}");
     tracing::info!("  Network: {}", args.network);
-    tracing::info!("  RPC: {}", net_config.rpc_url);
-    tracing::info!("  Registry: {}", args.registry_address);
+    tracing::info!("  RPC endpoints: {}", chain.endpoint_labels.join(", "));
+    tracing::info!(
+        "  Registry: {} (from block {})",
+        chain.registry_hex,
+        net_config.from_block
+    );
+    tracing::info!("  Confirmations: {}", net_config.confirmations);
     tracing::info!("  Uptime check interval: {}s", args.uptime_check_interval);
 
     let shutdown = state.shutdown.clone();

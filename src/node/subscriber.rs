@@ -441,6 +441,9 @@ pub async fn uptime_check_loop(state: AppState, interval_secs: u64) {
                 return;
             }
             _ = interval.tick() => {}
+            // Chain sync registered new members: probe now so they do not sit
+            // "offline" for a whole interval after a registry change.
+            () = state.probe_now.notified() => {}
         }
 
         let targets = match state.db.load_all_uptime_targets().await {
@@ -491,6 +494,15 @@ pub async fn uptime_check_loop(state: AppState, interval_secs: u64) {
 
         if let Err(e) = state.db.decay_stale_scores(6).await {
             tracing::warn!("Failed to decay stale scores: {e}");
+        }
+
+        if state.network_genesis_ms.read().is_none() && !probe_results.is_empty() {
+            let interval_ms =
+                i64::try_from(interval_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
+            match state.db.ensure_network_genesis(interval_ms).await {
+                Ok(genesis) => *state.network_genesis_ms.write() = genesis,
+                Err(e) => tracing::warn!("Failed to record network genesis: {e}"),
+            }
         }
     }
 }

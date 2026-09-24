@@ -76,6 +76,49 @@ cumulative_metrics!(
     egress_exited,
 );
 
+impl CumulativeMetrics {
+    /// The same totals keyed like the node exporter's JSON (`packetsReceived`, ...),
+    /// matching the per-node `metrics` objects served by `/v1/state`.
+    pub fn to_camel_case_json(&self) -> serde_json::Map<String, serde_json::Value> {
+        let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(self) else {
+            return serde_json::Map::new();
+        };
+        fields
+            .into_iter()
+            .map(|(key, value)| (snake_to_camel(&key), value))
+            .collect()
+    }
+}
+
+fn snake_to_camel(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut upper = false;
+    for c in key.chars() {
+        if c == '_' {
+            upper = true;
+        } else if upper {
+            out.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Lifetime totals across every node ever scraped, whatever its registration
+/// status: each node's banked prior incarnations plus the latest reading of its
+/// current one. For a node still being scraped this equals its live `metrics`
+/// value; for a deregistered node it is the last lifetime value seen.
+pub fn network_totals<'a>(offsets: impl IntoIterator<Item = &'a NodeOffset>) -> CumulativeMetrics {
+    let mut total = CumulativeMetrics::default();
+    for offset in offsets {
+        total.accumulate(&offset.banked);
+        total.accumulate(&offset.last_raw);
+    }
+    total
+}
+
 /// Per-node restart bookkeeping.
 #[derive(Clone, Debug, Default)]
 pub struct NodeOffset {
@@ -227,6 +270,30 @@ mod tests {
 
         assert!(off.observe(&reading(0, 2.0, 20.0)));
         assert_eq!(off.banked.packets_received, 1500.0);
+    }
+
+    #[test]
+    fn network_totals_match_live_values_and_keep_departed_nodes() {
+        // Node A restarted once and is still scraped.
+        let mut a = NodeOffset::default();
+        a.observe(&reading(1000, 100.0, 1_000.0));
+        a.observe(&reading(2000, 10.0, 50.0));
+        let mut live_a = reading(2000, 10.0, 50.0);
+        a.apply(&mut live_a);
+
+        // Node B was deregistered: no longer scraped, last reading retained.
+        let mut b = NodeOffset::default();
+        b.observe(&reading(3000, 40.0, 400.0));
+
+        let totals = network_totals([&a, &b]);
+        assert_eq!(totals.packets_received, live_a.packets_received + 400.0);
+        assert_eq!(totals.packets_received, 1_450.0);
+        assert_eq!(totals.uptime_seconds, 150.0);
+
+        let json = totals.to_camel_case_json();
+        assert_eq!(json["packetsReceived"], serde_json::json!(1_450.0));
+        assert!(json.contains_key("cumulativeAuthorizedRevenueUsd"));
+        assert!(!json.contains_key("packets_received"));
     }
 
     #[test]
