@@ -24,7 +24,18 @@ pub enum RpcErrorKind {
 /// together; a range complaint from any of them wins because shrinking the
 /// chunk is the only remedy that helps with it.
 pub fn classify_rpc_error(message: &str) -> RpcErrorKind {
-    let lower = message.to_lowercase();
+    let mut lower = message.to_lowercase();
+    // A range that ends past the endpoint's head is a lagging endpoint, not a
+    // size limit, and some of these texts contain "block range". Strip them
+    // first so they never lower the learned chunk ceiling.
+    const HEAD_MARKERS: [&str; 3] = [
+        "block range extends beyond current head block",
+        "invalid block range params",
+        "beyond current head",
+    ];
+    for marker in HEAD_MARKERS {
+        lower = lower.replace(marker, "");
+    }
     const RANGE_MARKERS: [&str; 12] = [
         "block range",
         "ranges over",
@@ -159,7 +170,16 @@ impl AdaptiveChunk {
     }
 
     /// `failed_span` is the number of blocks in the request that was rejected.
+    ///
+    /// A rejection of a span at or below the floor cannot be a size limit we can
+    /// work around, so it leaves the size and ceiling alone. Otherwise one odd
+    /// error in the live loop (spans of a few dozen blocks) would pin the
+    /// ceiling to the floor for the life of the process.
     pub fn on_range_error(&mut self, failed_span: u64, hint: Option<u64>) {
+        self.streak = 0;
+        if failed_span <= self.min {
+            return;
+        }
         let halved = failed_span / 2;
         let next = match hint {
             Some(limit) if limit < failed_span => limit,
@@ -167,7 +187,6 @@ impl AdaptiveChunk {
         };
         self.size = next.max(self.min);
         self.ceiling = self.ceiling.min(self.size).max(self.min);
-        self.streak = 0;
     }
 
     pub fn on_rate_limited(&mut self) {
@@ -226,6 +245,43 @@ mod tests {
             classify_rpc_error(joined),
             RpcErrorKind::RangeTooLarge { hint: Some(50_000) }
         );
+    }
+
+    #[test]
+    fn beyond_head_errors_are_transient_not_range_limits() {
+        assert_eq!(
+            classify_rpc_error(
+                r#"(code: -32602, message: block range extends beyond current head block, data: None)"#
+            ),
+            RpcErrorKind::Transient
+        );
+        assert_eq!(
+            classify_rpc_error("(code: -32000, message: invalid block range params, data: None)"),
+            RpcErrorKind::Transient
+        );
+        // A real limit from another endpoint in the same failover summary still wins.
+        let joined = "[a.example: block range extends beyond current head block] \
+                      [b.example: exceed maximum block range: 50000]";
+        assert_eq!(
+            classify_rpc_error(joined),
+            RpcErrorKind::RangeTooLarge { hint: Some(50_000) }
+        );
+        let joined = "[a.example: block range extends beyond current head block] \
+                      [b.example: 429 Too Many Requests]";
+        assert_eq!(classify_rpc_error(joined), RpcErrorKind::RateLimited);
+    }
+
+    #[test]
+    fn a_rejected_span_at_the_floor_leaves_the_ceiling_alone() {
+        let mut chunk = AdaptiveChunk::new(1_000_000, 500, 1_000_000);
+        chunk.on_range_error(48, None);
+        assert_eq!(chunk.size(), 1_000_000);
+        chunk.on_range_error(500, None);
+        assert_eq!(chunk.size(), 1_000_000);
+        for _ in 0..4 {
+            chunk.on_success();
+        }
+        assert_eq!(chunk.size(), 1_000_000, "ceiling must not have dropped");
     }
 
     #[test]
