@@ -37,6 +37,8 @@ struct Endpoint {
 pub struct FailoverHttp {
     endpoints: Arc<Vec<Endpoint>>,
     preferred: Arc<AtomicUsize>,
+    /// Index of the endpoint that served the most recent `eth_getLogs`.
+    logs_served_by: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for FailoverHttp {
@@ -96,7 +98,62 @@ impl FailoverHttp {
         Ok(Self {
             endpoints: Arc::new(endpoints),
             preferred: Arc::new(AtomicUsize::new(0)),
+            logs_served_by: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// The endpoint that served the most recent `eth_getLogs`. Only one task
+    /// fetches logs at a time, so this identifies the endpoint behind a result.
+    pub fn logs_served_by(&self) -> usize {
+        self.logs_served_by.load(Ordering::Relaxed)
+    }
+
+    pub fn label(&self, index: usize) -> &str {
+        self.endpoints
+            .get(index)
+            .map_or("?", |endpoint| endpoint.label.as_str())
+    }
+
+    /// `eth_blockNumber` on one specific endpoint, bypassing failover.
+    pub async fn block_number_on(&self, index: usize) -> Result<u64, String> {
+        let endpoint = self
+            .endpoints
+            .get(index)
+            .ok_or_else(|| format!("no RPC endpoint #{index}"))?;
+        let outcome = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            endpoint
+                .http
+                .request::<_, ethers::types::U64>("eth_blockNumber", ()),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(block)) => Ok(block.as_u64()),
+            Ok(Err(error)) => Err(format!(
+                "{}: eth_blockNumber failed: {}",
+                endpoint.label,
+                self.redact(&error.to_string())
+            )),
+            Err(_) => Err(format!(
+                "{}: eth_blockNumber timed out after {}s",
+                endpoint.label,
+                REQUEST_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    /// Stop preferring `index` (when it is preferred), so the next request tries
+    /// the following endpoint first.
+    pub fn demote(&self, index: usize) {
+        let count = self.endpoints.len();
+        if count > 1 {
+            let _ = self.preferred.compare_exchange(
+                index,
+                (index + 1) % count,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     pub fn labels(&self) -> Vec<String> {
@@ -184,6 +241,9 @@ impl JsonRpcClient for FailoverHttp {
                 tokio::time::timeout(REQUEST_TIMEOUT, endpoint.http.request(method, &params)).await;
             match outcome {
                 Ok(Ok(value)) => {
+                    if method == "eth_getLogs" {
+                        self.logs_served_by.store(index, Ordering::Relaxed);
+                    }
                     if index != start {
                         self.preferred.store(index, Ordering::Relaxed);
                         tracing::warn!(
