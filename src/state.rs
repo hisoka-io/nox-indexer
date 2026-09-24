@@ -219,8 +219,54 @@ pub struct SyncStatus {
     /// Whether the member set last matched the registry's count and fingerprint.
     pub verified: Option<bool>,
     pub attempts: u32,
+    /// Full text for logs; serialized as a coarse category (see
+    /// [`public_error_summary`]) because `/healthz` and `/v1/state` are public
+    /// and provider errors can carry keyed hostnames or internal addresses.
+    #[serde(serialize_with = "serialize_public_error")]
     pub last_error: Option<String>,
     pub last_synced_at_ms: Option<i64>,
+}
+
+/// A public, secret-free description of a chain sync error. The full error is
+/// always logged where it happens.
+pub fn public_error_summary(error: &str) -> &'static str {
+    use crate::chain::retry::{classify_rpc_error, RpcErrorKind};
+    let lower = error.to_lowercase();
+    if lower.contains("expected_chain_id") {
+        return "rpc chain id differs from EXPECTED_CHAIN_ID";
+    }
+    if lower.contains("disagrees with registry") {
+        return "replayed membership disagrees with the registry";
+    }
+    if [
+        "load checkpoint",
+        "load registry members",
+        "persist ",
+        "deregister stale",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return "database error";
+    }
+    if lower.contains("shutting down") {
+        return "shutting down";
+    }
+    match classify_rpc_error(error) {
+        RpcErrorKind::RateLimited => "rpc rate limited",
+        RpcErrorKind::RangeTooLarge { .. } => "rpc block range limit",
+        RpcErrorKind::Transient => "rpc or sync error (see indexer logs)",
+    }
+}
+
+fn serialize_public_error<S: serde::Serializer>(
+    error: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match error {
+        Some(error) => serializer.serialize_some(public_error_summary(error)),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Chain-pinned topology members, rebuilt lazily by `/seed/topology`.
@@ -281,6 +327,41 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_errors_are_published_as_categories_only() {
+        let status = SyncStatus {
+            last_error: Some(
+                "all 2 RPC endpoint(s) failed for eth_getLogs: [https://arb-sepolia.g.alchemy.com: \
+                 error sending request for url (http://postgres.railway.internal:5432)] \
+                 [https://x.example: 429 Too Many Requests]"
+                    .to_string(),
+            ),
+            ..SyncStatus::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["last_error"], "rpc rate limited");
+        let text = json.to_string();
+        assert!(
+            !text.contains("alchemy") && !text.contains("railway.internal"),
+            "{text}"
+        );
+
+        assert_eq!(
+            public_error_summary("persist node 0xabc: error returned from database: ..."),
+            "database error"
+        );
+        assert_eq!(
+            public_error_summary("full replay disagrees with registry: count 12 != 13"),
+            "replayed membership disagrees with the registry"
+        );
+        assert_eq!(
+            public_error_summary("RPC reports chain id 1 but EXPECTED_CHAIN_ID is 421614"),
+            "rpc chain id differs from EXPECTED_CHAIN_ID"
+        );
+        let none = serde_json::to_value(SyncStatus::default()).unwrap();
+        assert!(none["last_error"].is_null());
+    }
 
     #[test]
     fn chain_discovery_requires_a_liveness_probe_before_marking_a_member_online() {
