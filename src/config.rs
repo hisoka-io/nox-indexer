@@ -14,9 +14,29 @@ pub struct Args {
     #[arg(long, env = "REGISTRY_ADDRESS")]
     pub registry_address: String,
 
-    /// Ethereum JSON-RPC URL (overrides network default)
+    /// Ethereum JSON-RPC URL(s), comma-separated for failover (overrides network default)
     #[arg(long, env = "ETH_RPC_URL")]
     pub rpc_url: Option<String>,
+
+    /// Refuse to sync unless the RPC reports this chain id (e.g. 421614)
+    #[arg(long, env = "EXPECTED_CHAIN_ID")]
+    pub expected_chain_id: Option<u64>,
+
+    /// Blocks behind head treated as final (default: 0 on localtestnet, 20 otherwise)
+    #[arg(long, env = "CHAIN_CONFIRMATIONS")]
+    pub confirmations: Option<u64>,
+
+    /// Initial eth_getLogs block range; adapts to provider limits at runtime
+    #[arg(long, env = "LOG_CHUNK_SIZE", default_value = "50000")]
+    pub log_chunk_size: u64,
+
+    /// Smallest eth_getLogs block range the adaptive sizing may shrink to
+    #[arg(long, env = "LOG_CHUNK_MIN", default_value = "500")]
+    pub log_chunk_min: u64,
+
+    /// Largest eth_getLogs block range the adaptive sizing may grow to
+    #[arg(long, env = "LOG_CHUNK_MAX", default_value = "1000000")]
+    pub log_chunk_max: u64,
 
     /// Block number to start scanning events from (contract deployment block)
     #[arg(long, env = "FROM_BLOCK", default_value = "0")]
@@ -48,9 +68,10 @@ pub struct Args {
 }
 
 pub struct NetworkConfig {
-    pub rpc_url: String,
+    pub rpc_urls: Vec<String>,
     pub poll_interval_secs: u64,
     pub from_block: u64,
+    pub confirmations: u64,
 }
 
 impl NetworkConfig {
@@ -61,9 +82,9 @@ impl NetworkConfig {
                     .to_string(),
             );
         }
-        let (default_rpc, poll_secs) = match args.network.as_str() {
-            "localtestnet" => (Some("http://127.0.0.1:8545".to_string()), 6u64),
-            "testnet" | "mainnet" => (None, 12u64),
+        let (default_rpc, poll_secs, default_confirmations) = match args.network.as_str() {
+            "localtestnet" => (Some("http://127.0.0.1:8545".to_string()), 6u64, 0u64),
+            "testnet" | "mainnet" => (None, 12u64, 20u64),
             other => {
                 return Err(format!(
                     "Unknown network: {other}. Use localtestnet, testnet, or mainnet"
@@ -71,16 +92,23 @@ impl NetworkConfig {
             }
         };
 
-        let rpc_url = args
+        let rpc_urls = args
             .rpc_url
-            .clone()
-            .or(default_rpc)
+            .as_deref()
+            .map(crate::chain::rpc::parse_rpc_urls)
+            .filter(|urls| !urls.is_empty())
+            .or_else(|| default_rpc.map(|url| vec![url]))
             .ok_or_else(|| format!("--rpc-url is required for network '{}'", args.network))?;
 
+        if args.log_chunk_min == 0 || args.log_chunk_min > args.log_chunk_max {
+            return Err("LOG_CHUNK_MIN must be positive and not above LOG_CHUNK_MAX".to_string());
+        }
+
         Ok(Self {
-            rpc_url,
+            rpc_urls,
             poll_interval_secs: poll_secs,
             from_block: args.from_block,
+            confirmations: args.confirmations.unwrap_or(default_confirmations),
         })
     }
 }
@@ -89,22 +117,52 @@ impl NetworkConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn zero_start_block_is_rejected_before_an_unbounded_replay() {
-        let args = Args {
-            network: "localtestnet".to_string(),
+    fn args(network: &str, rpc_url: Option<&str>, from_block: u64) -> Args {
+        Args {
+            network: network.to_string(),
             registry_address: "0x1111111111111111111111111111111111111111".to_string(),
-            rpc_url: None,
-            from_block: 0,
+            rpc_url: rpc_url.map(str::to_string),
+            expected_chain_id: None,
+            confirmations: None,
+            log_chunk_size: 50_000,
+            log_chunk_min: 500,
+            log_chunk_max: 1_000_000,
+            from_block,
             port: 4_000,
             database_url: "postgres://localhost/indexer".to_string(),
             uptime_check_interval: 60,
             geoip_db_path: "./assets/GeoLite2-City.mmdb".to_string(),
-        };
+        }
+    }
 
+    #[test]
+    fn zero_start_block_is_rejected_before_an_unbounded_replay() {
         assert!(matches!(
-            NetworkConfig::resolve(&args),
+            NetworkConfig::resolve(&args("localtestnet", None, 0)),
             Err(message) if message.contains("FROM_BLOCK")
         ));
+    }
+
+    #[test]
+    fn comma_separated_rpc_urls_become_a_failover_list() {
+        let config = NetworkConfig::resolve(&args(
+            "testnet",
+            Some("https://a.example/rpc, https://b.example/rpc"),
+            10,
+        ))
+        .unwrap();
+        assert_eq!(
+            config.rpc_urls,
+            vec!["https://a.example/rpc", "https://b.example/rpc"]
+        );
+        assert_eq!(config.confirmations, 20);
+    }
+
+    #[test]
+    fn testnet_requires_an_rpc_url() {
+        assert!(NetworkConfig::resolve(&args("testnet", Some(" , "), 10)).is_err());
+        let local = NetworkConfig::resolve(&args("localtestnet", None, 10)).unwrap();
+        assert_eq!(local.rpc_urls, vec!["http://127.0.0.1:8545"]);
+        assert_eq!(local.confirmations, 0);
     }
 }

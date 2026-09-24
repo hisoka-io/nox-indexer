@@ -8,10 +8,18 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::json;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::broadcast::cluster_snapshot_json;
-use crate::state::{AppState, NodeState, NodeStatus};
+use crate::node::offsets::network_totals;
+use crate::state::{AppState, CachedSeed, NodeState, NodeStatus, SyncPhase};
+
+/// A pinned seed snapshot is reused for this long unless membership changes.
+const SEED_CACHE_TTL: Duration = Duration::from_secs(30);
+/// When a rebuild fails, a cached snapshot this young is still served. Its block
+/// stays recent enough for non-archive RPCs to verify against.
+const SEED_STALE_MAX: Duration = Duration::from_secs(600);
 
 #[derive(Serialize)]
 struct SeedTopologyNode {
@@ -25,6 +33,10 @@ struct SeedTopologyNode {
     role: u8,
     ingress_url: String,
     metadata_url: String,
+    /// Frozen members stay in `nodes` because the registry's count and
+    /// fingerprint include them, but their liveness is always `offline` so
+    /// clients never route through them.
+    frozen: bool,
 }
 
 #[derive(Serialize)]
@@ -45,16 +57,19 @@ struct SeedTopologySnapshot {
     liveness: Vec<SeedLiveness>,
 }
 
+/// 200 whenever Postgres answers, so a slow or retrying chain sync never fails
+/// the platform healthcheck. Chain progress is reported in the body.
 pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    let chain = state.sync.read().clone();
     match state.db.ping().await {
         Ok(()) => (
             axum::http::StatusCode::OK,
-            axum::Json(json!({ "status": "ok" })),
+            axum::Json(json!({ "status": "ok", "chain": chain })),
         )
             .into_response(),
         Err(e) => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(json!({ "status": "degraded", "error": e.to_string() })),
+            axum::Json(json!({ "status": "degraded", "error": e.to_string(), "chain": chain })),
         )
             .into_response(),
     }
@@ -78,7 +93,11 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
     let mut nodes: Vec<NodeState> = state.nodes.read().values().cloned().collect();
 
     if nodes.is_empty() {
-        if let Ok(db_nodes) = state.db.load_all_nodes().await {
+        if let Ok(db_nodes) = state
+            .db
+            .load_registry_nodes(&state.chain.registry_hex)
+            .await
+        {
             if !db_nodes.is_empty() {
                 let mut mem = state.nodes.write();
                 for (addr, ns) in &db_nodes {
@@ -88,6 +107,7 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
             }
         }
     }
+    nodes.sort_by(|left, right| left.address.cmp(&right.address));
 
     let node_addrs: std::collections::HashSet<&str> =
         nodes.iter().map(|n| n.address.as_str()).collect();
@@ -102,13 +122,30 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
 
     let events: Vec<serde_json::Value> = state.recent_events.read().iter().cloned().collect();
 
+    // Registered nodes only: deregistered rows would drag the average down forever.
     let reputation = state.db.get_reputation_ranking().await.unwrap_or_default();
+    let reputation_avg = (!reputation.is_empty())
+        .then(|| reputation.iter().map(|r| r.score).sum::<f64>() / reputation.len() as f64);
+
+    let (totals, totals_nodes) = {
+        let offsets = state.metric_offsets.read();
+        (network_totals(offsets.values()), offsets.len())
+    };
+    let mut network_totals_json = totals.to_camel_case_json();
+    network_totals_json.insert("nodeCount".to_string(), json!(totals_nodes));
+
+    let indexer = state.sync.read().clone();
+    let genesis = *state.network_genesis_ms.read();
 
     axum::Json(json!({
         "nodes": nodes,
         "metrics": metrics,
         "recent_events": events,
-        "reputation": reputation
+        "reputation": reputation,
+        "network_totals": network_totals_json,
+        "network_genesis_ms": genesis,
+        "network_reputation_avg": reputation_avg,
+        "indexer": indexer,
     }))
 }
 
@@ -133,14 +170,69 @@ pub async fn handle_seed_topology(State(state): State<AppState>) -> impl IntoRes
     }
 }
 
-async fn build_seed_topology(state: &AppState) -> Result<SeedTopologySnapshot, String> {
-    let block_number = state
-        .db
-        .get_last_chain_block()
+/// Chain-pinned members at the last processed block, cached per topology version.
+async fn pinned_seed_members(state: &AppState) -> Result<CachedSeed, String> {
+    let block_number = {
+        let sync = state.sync.read();
+        match (sync.phase, sync.last_block) {
+            (SyncPhase::Starting, _) | (_, None) | (_, Some(0)) => {
+                return Err("chain sync has not completed yet".to_string())
+            }
+            (_, Some(block)) => block,
+        }
+    };
+    let version = state.topology_version();
+
+    let mut cache = state.seed_cache.lock().await;
+    if let Some(cached) = cache.as_ref() {
+        if cached.topology_version == version && cached.built_at.elapsed() < SEED_CACHE_TTL {
+            return Ok(cached.clone());
+        }
+    }
+
+    let mut member_addresses: Vec<String> = state
+        .nodes
+        .read()
+        .values()
+        .filter(|node| node.status != NodeStatus::Deregistered)
+        .map(|node| node.address.to_lowercase())
+        .collect();
+    member_addresses.sort();
+    if member_addresses.is_empty() {
+        return Err("no replayed registered members are available".to_string());
+    }
+
+    match state
+        .chain
+        .pinned_topology_members(&member_addresses, block_number)
         .await
-        .map_err(|error| format!("load processed chain block: {error}"))?
-        .filter(|block| *block > 0)
-        .ok_or_else(|| "no processed chain block".to_string())?;
+    {
+        Ok((members, fingerprint)) => {
+            let fresh = CachedSeed {
+                block: block_number,
+                topology_version: version,
+                built_at: Instant::now(),
+                members,
+                fingerprint,
+            };
+            *cache = Some(fresh.clone());
+            Ok(fresh)
+        }
+        Err(error) => match cache.as_ref() {
+            Some(cached) if cached.built_at.elapsed() < SEED_STALE_MAX => {
+                tracing::warn!(
+                    "Seed rebuild at block {block_number} failed, serving block {}: {error}",
+                    cached.block
+                );
+                Ok(cached.clone())
+            }
+            _ => Err(error),
+        },
+    }
+}
+
+async fn build_seed_topology(state: &AppState) -> Result<SeedTopologySnapshot, String> {
+    let pinned = pinned_seed_members(state).await?;
     let observed_at: std::collections::HashMap<String, u64> = state
         .db
         .load_liveness_observed_at()
@@ -156,40 +248,32 @@ async fn build_seed_topology(state: &AppState) -> Result<SeedTopologySnapshot, S
         .filter(|node| node.status != NodeStatus::Deregistered)
         .map(|node| (node.address.to_lowercase(), node.status.clone()))
         .collect();
-    if statuses.is_empty() {
-        return Err("no replayed registered members are available".to_string());
-    }
-    let member_addresses: Vec<String> = statuses.keys().cloned().collect();
-    let (members, fingerprint) = state
-        .chain
-        .pinned_topology_members(&member_addresses, block_number)
-        .await?;
-    if members.len() != statuses.len() {
-        return Err("pinned member count differs from replayed member set".to_string());
-    }
 
     let now_unix = u64::try_from(chrono::Utc::now().timestamp())
         .map_err(|_| "system time is before Unix epoch".to_string())?;
     assemble_seed_topology(
-        members,
-        fingerprint,
-        statuses,
-        observed_at,
-        block_number,
+        pinned.members,
+        pinned.fingerprint,
+        &statuses,
+        &observed_at,
+        pinned.block,
         now_unix,
     )
 }
 
+/// Build the wire snapshot. Membership comes only from the chain-pinned set;
+/// indexer state contributes liveness, and a member it has no status for (or
+/// one that is frozen) is reported offline.
 fn assemble_seed_topology(
     members: Vec<crate::chain::PinnedTopologyNode>,
     fingerprint: String,
-    statuses: std::collections::BTreeMap<String, NodeStatus>,
-    observed_at: std::collections::HashMap<String, u64>,
+    statuses: &std::collections::BTreeMap<String, NodeStatus>,
+    observed_at: &std::collections::HashMap<String, u64>,
     block_number: u64,
     now_unix: u64,
 ) -> Result<SeedTopologySnapshot, String> {
-    if members.len() != statuses.len() {
-        return Err("pinned member count differs from replayed member set".to_string());
+    if members.is_empty() {
+        return Err("pinned topology has no members".to_string());
     }
     if members
         .windows(2)
@@ -200,12 +284,10 @@ fn assemble_seed_topology(
     let mut liveness = Vec::with_capacity(members.len());
     let mut nodes = Vec::with_capacity(members.len());
     for member in members {
-        let status = statuses.get(&member.address).cloned().ok_or_else(|| {
-            format!(
-                "pinned member {} is absent from replay state",
-                member.address
-            )
-        })?;
+        let status = match statuses.get(&member.address) {
+            Some(NodeStatus::Online) if !member.frozen => NodeStatus::Online,
+            _ => NodeStatus::Offline,
+        };
         let observation = observed_at.get(&member.address).copied().unwrap_or(0);
         liveness.push(SeedLiveness {
             address: member.address.clone(),
@@ -223,6 +305,7 @@ fn assemble_seed_topology(
             role: member.role,
             ingress_url: member.ingress_url,
             metadata_url: member.metadata_url,
+            frozen: member.frozen,
         });
     }
     Ok(SeedTopologySnapshot {
@@ -289,27 +372,30 @@ mod tests {
             role: 1,
             ingress_url: "http://127.0.0.1:9002".to_string(),
             metadata_url: String::new(),
+            frozen: false,
         }
     }
 
+    const ONLINE: &str = "0x1111111111111111111111111111111111111111";
+    const OFFLINE: &str = "0x2222222222222222222222222222222222222222";
+    const FROZEN: &str = "0x3333333333333333333333333333333333333333";
+
     #[test]
     fn seed_snapshot_retains_offline_registered_members_as_liveness_only() {
-        let online = "0x1111111111111111111111111111111111111111";
-        let offline = "0x2222222222222222222222222222222222222222";
         let statuses = std::collections::BTreeMap::from([
-            (online.to_string(), NodeStatus::Online),
-            (offline.to_string(), NodeStatus::Offline),
+            (ONLINE.to_string(), NodeStatus::Online),
+            (OFFLINE.to_string(), NodeStatus::Offline),
         ]);
         let observed = std::collections::HashMap::from([
-            (online.to_string(), 100_u64),
-            (offline.to_string(), 90_u64),
+            (ONLINE.to_string(), 100_u64),
+            (OFFLINE.to_string(), 90_u64),
         ]);
 
         let snapshot = assemble_seed_topology(
-            vec![member(online), member(offline)],
+            vec![member(ONLINE), member(OFFLINE)],
             "00".repeat(32),
-            statuses,
-            observed,
+            &statuses,
+            &observed,
             7,
             101,
         )
@@ -317,5 +403,61 @@ mod tests {
 
         assert_eq!(snapshot.nodes.len(), 2);
         assert_eq!(snapshot.liveness[1].status, NodeStatus::Offline);
+    }
+
+    #[test]
+    fn frozen_members_stay_in_the_fingerprinted_set_but_are_never_live() {
+        let statuses = std::collections::BTreeMap::from([
+            (ONLINE.to_string(), NodeStatus::Online),
+            (FROZEN.to_string(), NodeStatus::Online),
+        ]);
+        let mut frozen = member(FROZEN);
+        frozen.frozen = true;
+
+        let snapshot = assemble_seed_topology(
+            vec![member(ONLINE), frozen],
+            "00".repeat(32),
+            &statuses,
+            &std::collections::HashMap::new(),
+            7,
+            101,
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.nodes.len(),
+            2,
+            "count/fingerprint verification needs every member"
+        );
+        assert!(snapshot.nodes[1].frozen);
+        assert_eq!(snapshot.liveness[0].status, NodeStatus::Online);
+        assert_eq!(snapshot.liveness[1].status, NodeStatus::Offline);
+    }
+
+    #[test]
+    fn members_unknown_to_the_indexer_are_reported_offline() {
+        let snapshot = assemble_seed_topology(
+            vec![member(ONLINE)],
+            "00".repeat(32),
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashMap::new(),
+            7,
+            101,
+        )
+        .unwrap();
+        assert_eq!(snapshot.liveness[0].status, NodeStatus::Offline);
+    }
+
+    #[test]
+    fn unordered_members_are_rejected() {
+        assert!(assemble_seed_topology(
+            vec![member(OFFLINE), member(ONLINE)],
+            "00".repeat(32),
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashMap::new(),
+            7,
+            101,
+        )
+        .is_err());
     }
 }

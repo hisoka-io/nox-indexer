@@ -4,9 +4,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tokio_util::sync::CancellationToken;
 
 /// Assign initial layer based on role, matching NOX TopologyManager logic.
@@ -27,7 +28,7 @@ pub fn primary_layer_for_role(role: u8, address: &str) -> u8 {
 }
 
 use crate::chain::ChainConfig;
-use crate::chain::{self, OnChainNode};
+use crate::chain::{self, OnChainNode, PinnedTopologyNode};
 use crate::db::{Db, NodeRow};
 use crate::node::metrics::StructuredMetrics;
 
@@ -107,6 +108,13 @@ pub struct NodeState {
     pub layer: u8,
     pub latitude: f64,
     pub longitude: f64,
+    /// Frozen by the registry's slasher: still a member (counted in the
+    /// fingerprint) but excluded from routing and seed liveness.
+    pub frozen: bool,
+    #[serde(skip)]
+    pub registry_address: String,
+    #[serde(skip)]
+    pub chain_id: u64,
 }
 
 impl From<NodeRow> for NodeState {
@@ -131,12 +139,15 @@ impl From<NodeRow> for NodeState {
             layer: row.layer as u8,
             latitude: row.latitude,
             longitude: row.longitude,
+            frozen: row.frozen,
+            registry_address: row.registry_address,
+            chain_id: u64::try_from(row.chain_id).unwrap_or_default(),
         }
     }
 }
 
 impl NodeState {
-    pub fn from_chain_info(info: &OnChainNode) -> Self {
+    pub fn from_chain_info(info: &OnChainNode, chain_id: u64, registry_address: &str) -> Self {
         let admin_url = chain::derive_admin_url(&info.url);
         let parsed = chain::parse_multiaddr(&info.url);
         let admin_port = parsed.as_ref().map_or(0, |(_, p)| p + 1);
@@ -150,7 +161,7 @@ impl NodeState {
 
         Self {
             id,
-            address: info.address.clone(),
+            address: info.address.to_lowercase(),
             admin_port,
             ingress_port,
             p2p_addr: info.url.clone(),
@@ -163,6 +174,9 @@ impl NodeState {
             layer: primary_layer_for_role(info.role, &info.address),
             latitude: 0.0,
             longitude: 0.0,
+            frozen: info.frozen,
+            registry_address: registry_address.to_lowercase(),
+            chain_id,
         }
     }
 
@@ -176,6 +190,47 @@ impl NodeState {
             }
         }
     }
+}
+
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncPhase {
+    /// Serving the database only; the first chain sync has not finished.
+    #[default]
+    Starting,
+    /// Replaying or resuming registry events.
+    Syncing,
+    /// A sync attempt failed and is being retried with backoff.
+    Retrying,
+    /// Initial sync done; following new blocks.
+    Live,
+}
+
+/// Chain discovery progress, exposed on `/healthz` and `/v1/state`.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct SyncStatus {
+    pub phase: SyncPhase,
+    pub chain_id: Option<u64>,
+    pub registry_address: String,
+    /// Last block whose registry events are fully applied (the checkpoint).
+    pub last_block: Option<u64>,
+    /// Replay progress while syncing.
+    pub scan_block: Option<u64>,
+    /// Whether the member set last matched the registry's count and fingerprint.
+    pub verified: Option<bool>,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub last_synced_at_ms: Option<i64>,
+}
+
+/// Chain-pinned topology members, rebuilt lazily by `/seed/topology`.
+#[derive(Clone)]
+pub struct CachedSeed {
+    pub block: u64,
+    pub topology_version: u64,
+    pub built_at: Instant,
+    pub members: Vec<PinnedTopologyNode>,
+    pub fingerprint: String,
 }
 
 #[derive(Clone)]
@@ -192,6 +247,35 @@ pub struct AppState {
     /// Per-node banked lifetime totals, so container restarts do not reset the
     /// cumulative figures shown on the dashboard.
     pub metric_offsets: Arc<RwLock<HashMap<String, crate::node::offsets::NodeOffset>>>,
+    pub sync: Arc<RwLock<SyncStatus>>,
+    /// Bumped whenever registry membership or a profile changes, invalidating the seed cache.
+    pub topology_version: Arc<AtomicU64>,
+    pub seed_cache: Arc<tokio::sync::Mutex<Option<CachedSeed>>>,
+    /// Wakes the uptime loop so new members are probed without waiting a full interval.
+    pub probe_now: Arc<Notify>,
+    /// Earliest evidence of the network (first uptime check), in Unix ms.
+    pub network_genesis_ms: Arc<RwLock<Option<i64>>>,
+}
+
+impl AppState {
+    pub fn bump_topology_version(&self) {
+        self.topology_version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn topology_version(&self) -> u64 {
+        self.topology_version.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_synced(&self, block: u64, verified: bool) {
+        let mut sync = self.sync.write();
+        sync.phase = SyncPhase::Live;
+        sync.last_block = Some(block);
+        sync.scan_block = Some(block);
+        sync.verified = Some(verified);
+        sync.attempts = 0;
+        sync.last_error = None;
+        sync.last_synced_at_ms = Some(chrono::Utc::now().timestamp_millis());
+    }
 }
 
 #[cfg(test)]
@@ -200,15 +284,21 @@ mod tests {
 
     #[test]
     fn chain_discovery_requires_a_liveness_probe_before_marking_a_member_online() {
-        let node = NodeState::from_chain_info(&OnChainNode {
-            address: "0x1111111111111111111111111111111111111111".to_string(),
-            url: "/ip4/127.0.0.1/tcp/9000".to_string(),
-            ingress_url: "http://127.0.0.1:9002".to_string(),
-            metadata_url: String::new(),
-            sphinx_key: "11".repeat(32),
-            role: 1,
-        });
+        let node = NodeState::from_chain_info(
+            &OnChainNode {
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                url: "/ip4/127.0.0.1/tcp/9000".to_string(),
+                ingress_url: "http://127.0.0.1:9002".to_string(),
+                metadata_url: String::new(),
+                sphinx_key: "11".repeat(32),
+                role: 1,
+                frozen: false,
+            },
+            421_614,
+            "0xABC",
+        );
 
         assert_eq!(node.status, NodeStatus::Offline);
+        assert_eq!(node.registry_address, "0xabc");
     }
 }
