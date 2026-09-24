@@ -196,12 +196,36 @@ fn spawn_background_tasks(
     handles
 }
 
+/// Cancel on SIGINT or SIGTERM. Railway (like Docker) stops containers with
+/// SIGTERM, and the graceful path flushes metric offsets before exit.
 fn install_shutdown_handler(shutdown: CancellationToken) {
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+        wait_for_shutdown_signal().await;
         tracing::info!("Received shutdown signal");
         shutdown.cancel();
     });
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        Err(error) => {
+            tracing::warn!("Cannot listen for SIGTERM ({error}); only Ctrl-C stops gracefully");
+            tokio::signal::ctrl_c().await.ok();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    tokio::signal::ctrl_c().await.ok();
 }
 
 async fn serve_http(state: AppState, port: u16, net_config: &NetworkConfig, args: &Args) {
