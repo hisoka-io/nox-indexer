@@ -70,10 +70,10 @@ WS   /v1/live         pushes CLUSTER / METRICS / EVENT messages
 
 | Field | Meaning |
 |-------|---------|
-| `network_totals` | Lifetime counters (`packetsReceived`, `packetsForwarded`, ...) summed over every node ever scraped, registered or not, plus `nodeCount` |
+| `network_totals` | Lifetime counters (`packetsReceived`, `packetsForwarded`, ...) summed over every node ever scraped, registered or not, plus `scrapedNodeCount` (how many nodes feed the totals; not the registered count, which is `nodes.length`) |
 | `network_genesis_ms` | Earliest uptime-check evidence (Unix ms), estimated once as `last_check_ms - total_checks * interval` |
 | `network_reputation_avg` | Mean reputation of registered nodes only |
-| `indexer` | Sync `phase` (`starting`, `syncing`, `retrying`, `live`), `chain_id`, `registry_address`, `last_block`, `verified`, `attempts`, `last_error` |
+| `indexer` | Sync `phase` (`starting`, `syncing`, `retrying`, `live`), `chain_id`, `registry_address`, `last_block`, `verified`, `attempts`, `last_error` (a coarse category such as `rpc rate limited`; the full error is only in the logs) |
 
 Nodes carry `frozen`: a frozen node is still a registry member but must not be routed through.
 

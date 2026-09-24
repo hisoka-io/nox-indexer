@@ -67,11 +67,17 @@ pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse 
             axum::Json(json!({ "status": "ok", "chain": chain })),
         )
             .into_response(),
-        Err(e) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(json!({ "status": "degraded", "error": e.to_string(), "chain": chain })),
-        )
-            .into_response(),
+        Err(e) => {
+            // The driver error can name internal hosts; keep it in the logs only.
+            tracing::warn!("Healthcheck database ping failed: {e}");
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(
+                    json!({ "status": "degraded", "error": "database unavailable", "chain": chain }),
+                ),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -132,7 +138,9 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
         (network_totals(offsets.values()), offsets.len())
     };
     let mut network_totals_json = totals.to_camel_case_json();
-    network_totals_json.insert("nodeCount".to_string(), json!(totals_nodes));
+    // Nodes whose counters feed the totals (every node ever scraped). This is
+    // not the registered node count; that is `nodes.length`.
+    network_totals_json.insert("scrapedNodeCount".to_string(), json!(totals_nodes));
 
     let indexer = state.sync.read().clone();
     let genesis = *state.network_genesis_ms.read();
