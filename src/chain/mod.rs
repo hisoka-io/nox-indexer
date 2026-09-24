@@ -53,6 +53,12 @@ const CHUNK_BACKOFF_CAP: Duration = Duration::from_secs(30);
 const MAX_CALL_ATTEMPTS: u32 = 5;
 /// Concurrent profile reads when pinning a topology snapshot.
 const PROFILE_READ_CONCURRENCY: usize = 4;
+/// Chunks ending within this many blocks of the sync target are checked against
+/// the head of the endpoint that served them. Some providers (the official
+/// Arbitrum RPC among them) silently cut `eth_getLogs` off at their own head
+/// instead of erroring, so a lagging endpoint would otherwise advance the
+/// checkpoint past events it never returned.
+const HEAD_CHECK_WINDOW: u64 = 100_000;
 
 /// `eth_getLogs` range tuning.
 #[derive(Debug, Clone, Copy)]
@@ -268,10 +274,13 @@ impl ChainConfig {
                 .to_block(end);
 
             let error = match self.provider.get_logs(&filter).await {
-                Ok(logs) => {
-                    self.chunk.lock().on_success();
-                    return Ok((logs, end));
-                }
+                Ok(logs) => match self.check_logs_endpoint_head(end, to).await {
+                    Ok(()) => {
+                        self.chunk.lock().on_success();
+                        return Ok((logs, end));
+                    }
+                    Err(error) => error,
+                },
                 Err(error) => error.to_string(),
             };
 
@@ -310,6 +319,26 @@ impl ChainConfig {
                 () = tokio::time::sleep(delay) => {}
             }
         }
+    }
+
+    /// Confirm the endpoint that just served logs up to `end` has actually
+    /// reached `end`. A lagging endpoint is demoted so the retry goes elsewhere.
+    async fn check_logs_endpoint_head(&self, end: u64, to: u64) -> Result<(), String> {
+        if to.saturating_sub(end) >= HEAD_CHECK_WINDOW {
+            return Ok(());
+        }
+        let transport = self.provider.as_ref();
+        let index = transport.logs_served_by();
+        let head = transport.block_number_on(index).await?;
+        if head >= end {
+            return Ok(());
+        }
+        transport.demote(index);
+        Err(format!(
+            "{} is behind: its head {head} is below requested log end {end}; \
+             discarding the possibly truncated result",
+            transport.label(index)
+        ))
     }
 
     pub fn decode_log(&self, log: &Log) -> Option<ChainNodeEvent> {
@@ -587,6 +616,88 @@ pub fn derive_admin_url(multiaddr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JSON-RPC endpoint that reports `head` and serves empty log ranges.
+    async fn mock_endpoint(head: u64) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0_u8; 8192];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]);
+                let result = if request.contains("eth_blockNumber") {
+                    format!("\"{head:#x}\"")
+                } else {
+                    "[]".to_string()
+                };
+                let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    fn test_chain(urls: &[String]) -> ChainConfig {
+        ChainConfig::new(
+            urls,
+            "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            1,
+            0,
+            20,
+            None,
+            LogChunkConfig {
+                initial: 1_000,
+                min: 10,
+                max: 1_000,
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn logs_from_an_endpoint_behind_the_range_end_are_refetched_elsewhere() {
+        let lagging = mock_endpoint(100).await;
+        let healthy = mock_endpoint(200).await;
+        let chain = test_chain(&[lagging, healthy]);
+        let shutdown = CancellationToken::new();
+
+        let (logs, end) = chain.fetch_logs_chunk(90, 150, &shutdown).await.unwrap();
+        assert!(logs.is_empty());
+        assert_eq!(end, 150);
+        assert_eq!(
+            chain.provider.as_ref().logs_served_by(),
+            1,
+            "the result must come from the endpoint that has reached block 150"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_head_check_only_runs_near_the_target() {
+        let lagging = mock_endpoint(100).await;
+        let chain = test_chain(&[lagging]);
+        // Deep in a replay: the endpoint's head is irrelevant.
+        assert!(chain.check_logs_endpoint_head(150, 1_000_000).await.is_ok());
+        let error = chain
+            .check_logs_endpoint_head(150, 150)
+            .await
+            .expect_err("an endpoint at block 100 cannot have served logs up to 150");
+        assert!(error.contains("is behind"), "{error}");
+        assert_eq!(
+            retry::classify_rpc_error(&error),
+            RpcErrorKind::Transient,
+            "a lagging endpoint must not shrink the chunk size"
+        );
+        assert!(chain.check_logs_endpoint_head(100, 100).await.is_ok());
+    }
 
     #[test]
     fn pinned_membership_rejects_a_partial_replay() {
