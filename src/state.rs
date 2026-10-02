@@ -150,13 +150,19 @@ impl NodeState {
     pub fn from_chain_info(info: &OnChainNode, chain_id: u64, registry_address: &str) -> Self {
         let admin_url = chain::derive_admin_url(&info.url);
         let parsed = chain::parse_multiaddr(&info.url);
-        let admin_port = parsed.as_ref().map_or(0, |(_, p)| p + 1);
-        let ingress_port = parsed.as_ref().map_or(0, |(_, p)| p + 2);
+        let admin_port = parsed
+            .as_ref()
+            .and_then(|(_, p)| p.checked_add(1))
+            .unwrap_or(0);
+        let ingress_port = parsed
+            .as_ref()
+            .and_then(|(_, p)| p.checked_add(2))
+            .unwrap_or(0);
 
         let id = if info.address.len() >= 10 {
             format!("nox-{}", &info.address[2..10])
         } else {
-            format!("nox-{}", &info.address)
+            format!("nox-{}", info.address)
         };
 
         Self {
