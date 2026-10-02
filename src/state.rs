@@ -124,6 +124,10 @@ impl From<NodeRow> for NodeState {
         } else {
             row.admin_url
         };
+        // Derived from the registry role like the seed topology, never from the
+        // stored column, which older versions overwrote with whatever one
+        // node's /topology reported.
+        let layer = primary_layer_for_role(row.role as u8, &row.address);
         Self {
             address: row.address,
             id: row.id,
@@ -136,7 +140,7 @@ impl From<NodeRow> for NodeState {
             metadata_url: row.metadata_url,
             status: NodeStatus::from_str(&row.status),
             role: row.role as u8,
-            layer: row.layer as u8,
+            layer,
             latitude: row.latitude,
             longitude: row.longitude,
             frozen: row.frozen,
@@ -327,6 +331,82 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(address: &str, role: i16) -> NodeRow {
+        NodeRow {
+            address: address.to_string(),
+            id: "nox-test".to_string(),
+            admin_port: 9001,
+            ingress_port: 9002,
+            p2p_addr: "/ip4/127.0.0.1/tcp/9000".to_string(),
+            sphinx_key: "11".repeat(32),
+            admin_url: String::new(),
+            ingress_url: String::new(),
+            metadata_url: String::new(),
+            status: "online".to_string(),
+            role,
+            latitude: 0.0,
+            longitude: 0.0,
+            frozen: false,
+            registry_address: "0xabc".to_string(),
+            chain_id: 421_614,
+        }
+    }
+
+    #[test]
+    fn exits_are_always_the_last_layer() {
+        for address in [
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+        ] {
+            assert_eq!(primary_layer_for_role(2, address), 2);
+            assert!(primary_layer_for_role(1, address) < 2);
+            assert!(primary_layer_for_role(3, address) < 3);
+        }
+    }
+
+    #[test]
+    fn layer_is_case_insensitive_in_the_address() {
+        let lower = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let mixed = "0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD";
+        for role in 1..=3 {
+            assert_eq!(
+                primary_layer_for_role(role, lower),
+                primary_layer_for_role(role, mixed)
+            );
+        }
+    }
+
+    #[test]
+    fn nodes_loaded_from_the_database_take_their_layer_from_the_registry_role() {
+        // Rows written by older versions can hold a layer copied from a node's
+        // own /topology (an exit stored at layer 0). The role decides.
+        let exit = NodeState::from(row("0x1111111111111111111111111111111111111111", 2));
+        assert_eq!(exit.layer, 2);
+
+        let relay_address = "0x2222222222222222222222222222222222222222";
+        let relay = NodeState::from(row(relay_address, 1));
+        assert_eq!(relay.layer, primary_layer_for_role(1, relay_address));
+    }
+
+    #[test]
+    fn chain_discovery_derives_the_layer_from_the_on_chain_role() {
+        let exit = NodeState::from_chain_info(
+            &OnChainNode {
+                address: "0x4444444444444444444444444444444444444444".to_string(),
+                url: "/ip4/127.0.0.1/tcp/9000".to_string(),
+                ingress_url: String::new(),
+                metadata_url: String::new(),
+                sphinx_key: "11".repeat(32),
+                role: 2,
+                frozen: false,
+            },
+            421_614,
+            "0xabc",
+        );
+        assert_eq!((exit.role, exit.layer), (2, 2));
+    }
 
     #[test]
     fn sync_errors_are_published_as_categories_only() {

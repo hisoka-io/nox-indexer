@@ -185,11 +185,6 @@ fn spawn_background_tasks(
 
     let s = state.clone();
     handles.push(tokio::spawn(async move {
-        node::subscriber::periodic_topology_sync(s).await
-    }));
-
-    let s = state.clone();
-    handles.push(tokio::spawn(async move {
         node::subscriber::metric_offset_flush_loop(s, METRIC_OFFSET_FLUSH_SECS).await
     }));
 

@@ -6,8 +6,6 @@ use reqwest_eventsource::{Event, EventSource};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use serde::Deserialize;
-
 use crate::broadcast::{broadcast_cluster_snapshot, broadcast_event, broadcast_metrics};
 use crate::node::events::IngestEvent;
 use crate::node::metrics::StructuredMetrics;
@@ -15,83 +13,6 @@ use crate::node::offsets::NodeOffset;
 use crate::state::{AppState, NodeStatus, MAX_RECENT_EVENTS};
 
 const UPTIME_CONCURRENCY: usize = 20;
-
-#[derive(Deserialize)]
-struct TopoNode {
-    address: String,
-    #[serde(default)]
-    layer: u8,
-    #[serde(default = "default_role")]
-    role: u8,
-}
-
-fn default_role() -> u8 {
-    1
-}
-
-#[derive(Deserialize)]
-struct TopoSnapshot {
-    nodes: Vec<TopoNode>,
-}
-
-async fn sync_topology_from_node(state: &AppState, base_url: &str) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
-
-    let url = format!("{base_url}/topology");
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.json::<TopoSnapshot>().await {
-            Ok(snapshot) => {
-                let updated_nodes = {
-                    let mut nodes = state.nodes.write();
-                    let mut changed = Vec::new();
-                    for topo_node in &snapshot.nodes {
-                        if let Some(ns) = nodes.get_mut(&topo_node.address) {
-                            if ns.layer != topo_node.layer || ns.role != topo_node.role {
-                                tracing::info!(
-                                    "Topology: {} layer {} -> {}, role {} -> {}",
-                                    ns.address,
-                                    ns.layer,
-                                    topo_node.layer,
-                                    ns.role,
-                                    topo_node.role
-                                );
-                                ns.layer = topo_node.layer;
-                                ns.role = topo_node.role;
-                                changed.push(ns.clone());
-                            }
-                        }
-                    }
-                    changed
-                };
-
-                if !updated_nodes.is_empty() {
-                    for node in &updated_nodes {
-                        if let Err(e) = state.db.upsert_node(node).await {
-                            tracing::warn!("Failed to persist node {}: {e}", node.address);
-                        }
-                    }
-                    broadcast_cluster_snapshot(state);
-                }
-                tracing::info!(
-                    "Topology sync: {} nodes from {base_url}",
-                    snapshot.nodes.len()
-                );
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse topology from {base_url}: {e}");
-            }
-        },
-        Ok(resp) => {
-            tracing::debug!("Topology fetch from {base_url} returned {}", resp.status());
-        }
-        Err(e) => {
-            tracing::debug!("Topology fetch from {base_url} failed: {e}");
-        }
-    }
-}
 
 pub fn process_event(state: &AppState, node_address: &str, event: &IngestEvent) {
     let dedup_key = match event {
@@ -366,8 +287,6 @@ pub async fn manage_subscriptions(state: AppState) {
             })
             .collect();
 
-        let mut new_node_url: Option<String> = None;
-
         for (addr, base_url) in &current_nodes {
             if active.contains_key(addr) {
                 continue;
@@ -398,14 +317,6 @@ pub async fn manage_subscriptions(state: AppState) {
                     cancel,
                 },
             );
-
-            if new_node_url.is_none() {
-                new_node_url = Some(base_url.clone());
-            }
-        }
-
-        if let Some(url) = new_node_url {
-            sync_topology_from_node(&state, &url).await;
         }
 
         let removed: Vec<String> = active
@@ -546,32 +457,4 @@ async fn apply_status_change(state: &AppState, address: &str, reachable: bool) -
         }
     }
     false
-}
-
-pub async fn periodic_topology_sync(state: AppState) {
-    let mut interval = tokio::time::interval(Duration::from_secs(300));
-    interval.tick().await; // skip the immediate first tick
-
-    loop {
-        tokio::select! {
-            _ = state.shutdown.cancelled() => {
-                tracing::info!("periodic_topology_sync: shutting down");
-                return;
-            }
-            _ = interval.tick() => {}
-        }
-
-        let maybe_url = {
-            let nodes = state.nodes.read();
-            nodes
-                .values()
-                .find(|n| n.status == NodeStatus::Online && !n.admin_url.is_empty())
-                .map(|n| n.admin_url.clone())
-        };
-
-        if let Some(url) = maybe_url {
-            tracing::debug!("Periodic topology sync from {url}");
-            sync_topology_from_node(&state, &url).await;
-        }
-    }
 }

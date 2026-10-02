@@ -72,10 +72,11 @@ impl Db {
         let rows = sqlx::query_as::<_, NodeRow>(
             // Every NodeRow field must appear here: a missing column makes FromRow
             // fail to decode, which previously surfaced as a silent "0 nodes from
-            // DB" and forced a full chain replay on every boot.
+            // DB" and forced a full chain replay on every boot. `layer` is not
+            // read back: it is derived from `role` (see `NodeState::from`).
             "SELECT address, id, admin_port, ingress_port, p2p_addr,
                     sphinx_key, admin_url, ingress_url, metadata_url,
-                    status, role, layer, latitude, longitude,
+                    status, role, latitude, longitude,
                     frozen, registry_address, chain_id
              FROM nodes
              WHERE status != 'deregistered' AND registry_address = $1",
@@ -435,7 +436,6 @@ pub(crate) struct NodeRow {
     pub metadata_url: String,
     pub status: String,
     pub role: i16,
-    pub layer: i16,
     pub latitude: f64,
     pub longitude: f64,
     pub frozen: bool,
