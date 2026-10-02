@@ -643,9 +643,32 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
-                let mut buf = vec![0_u8; 8192];
-                let read = socket.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..read]);
+                // Read the whole request: under load a single read can return
+                // only the headers, and the method name is in the body.
+                let mut buf = Vec::new();
+                let mut chunk = vec![0_u8; 8192];
+                loop {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
                 let result = if request.contains("eth_blockNumber") {
                     format!("\"{head:#x}\"")
                 } else {
