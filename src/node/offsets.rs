@@ -12,13 +12,16 @@
 //! are passed through untouched.
 //!
 //! Counters are self-reported by registrants, so a reading is never taken at
-//! face value. Each counter may only move forward, and by at most its rate
-//! ceiling times the time since the previous reading. A counter that goes
-//! backwards without a restart is held at its last accepted value, and a jump
-//! larger than the ceiling is accepted in ceiling-sized steps. A node that
-//! really is ahead (first sight, or after an indexer outage) therefore catches
-//! up over a few scrapes, and no reading moves a total by more than the
-//! ceiling allows.
+//! face value. Each counter may only move forward, and its growth is limited
+//! by a per-counter allowance: the allowance fills at the counter's rate
+//! ceiling for every second between readings, up to [`MAX_READING_WINDOW`]
+//! worth, and each accepted increase spends it. Counters that the node only
+//! refreshes periodically (uptime moves in 30s steps) therefore pass unchanged,
+//! while sustained growth can never exceed the rate ceiling. A counter that
+//! goes backwards without a restart is held at its last accepted value, and a
+//! jump larger than the allowance is accepted in allowance-sized steps. A node
+//! that really is ahead (first sight, or after an indexer outage) therefore
+//! catches up over a few scrapes.
 
 use std::time::{Duration, Instant};
 
@@ -26,9 +29,10 @@ use serde::{Deserialize, Serialize};
 
 use super::metrics::StructuredMetrics;
 
-/// Increase a counter may show per second of wall time between two readings.
-/// These are far above anything the network has produced (live nodes run below
-/// one packet per second) but bound what one registrant can add to the totals.
+/// Sustained increase a counter may show per second of wall time. These are
+/// far above anything the network has produced (live nodes run below one
+/// packet per second). They stop absurd values, not plausible ones: they are a
+/// sanity bound on the totals, not a check that the traffic was real.
 const PACKETS_PER_SEC: f64 = 1_000.0;
 const SUBMISSIONS_PER_SEC: f64 = 10.0;
 const USD_PER_SEC: f64 = 1.0;
@@ -39,6 +43,8 @@ const UPTIME_PER_SEC: f64 = 2.0;
 /// seen for the first time, or the first scrape after an indexer restart).
 pub const FIRST_READING_WINDOW: Duration = Duration::from_secs(60);
 /// Bounds on the time credited between two readings. The scrape interval is 5s.
+/// The upper bound is also the most allowance a counter can hold, so a burst
+/// never exceeds this much time at the rate ceiling.
 const MIN_READING_WINDOW: Duration = Duration::from_secs(1);
 const MAX_READING_WINDOW: Duration = Duration::from_secs(60);
 
@@ -79,15 +85,25 @@ macro_rules! cumulative_metrics {
                 true $(&& self.$field == 0.0)*
             }
 
-            /// Move these accepted values toward a reported reading, at most
-            /// `RATE_CEILINGS * window_secs` per field and never backwards.
+            /// Move these accepted values toward a reported reading, never
+            /// backwards. Each field's `allowance` first grows by
+            /// `RATE_CEILINGS * window_secs` (up to `MAX_READING_WINDOW` worth),
+            /// and every accepted increase is taken out of it.
             /// Returns true if any reported value was not taken as is.
-            fn advance_toward(&mut self, reported: &Self, window_secs: f64) -> bool {
+            fn advance_toward(
+                &mut self,
+                reported: &Self,
+                allowance: &mut Self,
+                window_secs: f64,
+            ) -> bool {
+                let max_window_secs = MAX_READING_WINDOW.as_secs() as f64;
                 let mut adjusted = false;
                 $(adjusted |= advance_counter(
                     &mut self.$field,
                     reported.$field,
+                    &mut allowance.$field,
                     RATE_CEILINGS.$field * window_secs,
+                    RATE_CEILINGS.$field * max_window_secs,
                 );)*
                 adjusted
             }
@@ -120,19 +136,29 @@ cumulative_metrics!(
     egress_exited: PACKETS_PER_SEC,
 );
 
-/// Advance one accepted counter toward its reported value. Returns true when
-/// the report was not taken as is (not a finite number, lower than the
-/// accepted value, or above the allowed step).
-fn advance_counter(accepted: &mut f64, reported: f64, max_step: f64) -> bool {
+/// Advance one accepted counter toward its reported value. `allowance` is
+/// first refilled by `refill` (capped at `capacity`), then spent on the
+/// accepted increase. Returns true when the report was not taken as is (not a
+/// finite number, lower than the accepted value, or above the allowance).
+fn advance_counter(
+    accepted: &mut f64,
+    reported: f64,
+    allowance: &mut f64,
+    refill: f64,
+    capacity: f64,
+) -> bool {
+    *allowance = (*allowance + refill).min(capacity);
     if !reported.is_finite() || reported < *accepted {
         return true;
     }
     let step = reported - *accepted;
-    if step > max_step {
-        *accepted += max_step;
+    if step > *allowance {
+        *accepted += *allowance;
+        *allowance = 0.0;
         true
     } else {
         *accepted = reported;
+        *allowance -= step;
         false
     }
 }
@@ -195,6 +221,10 @@ pub struct NodeOffset {
     pub dirty: bool,
     /// When the previous reading was observed in this process. Not persisted.
     pub last_observed_at: Option<Instant>,
+    /// Growth each counter may still take (see
+    /// [`CumulativeMetrics::advance_toward`]). Not persisted: a fresh process
+    /// starts empty and credits [`FIRST_READING_WINDOW`] on the first reading.
+    pub allowance: CumulativeMetrics,
     /// Whether the previous reading was adjusted, so callers can log only when
     /// a node starts reporting out-of-bounds values. Not persisted.
     pub adjusting: bool,
@@ -219,9 +249,9 @@ impl NodeOffset {
     ///
     /// The reported counters are then checked against the accepted ones (see
     /// [`CumulativeMetrics::advance_toward`]): they may not move backwards within
-    /// an incarnation, and may not grow faster than their rate ceilings over the
-    /// time since the previous reading. A new incarnation starts from zero, so the
-    /// ceilings also hold across restarts.
+    /// an incarnation, and may not grow by more than the allowance built up at
+    /// their rate ceilings. A new incarnation starts from zero and the allowance
+    /// carries over, so the ceilings also hold across restarts.
     pub fn observe(&mut self, m: &StructuredMetrics, now: Instant) -> Observation {
         let start = m.node_start_time as i64;
 
@@ -258,9 +288,11 @@ impl NodeOffset {
 
         // Whole seconds keep capped counts whole.
         let window_secs = window.as_secs() as f64;
-        let adjusted = self
-            .last_raw
-            .advance_toward(&CumulativeMetrics::snapshot(m), window_secs);
+        let adjusted = self.last_raw.advance_toward(
+            &CumulativeMetrics::snapshot(m),
+            &mut self.allowance,
+            window_secs,
+        );
         Observation {
             restarted,
             adjusted,
@@ -455,17 +487,20 @@ mod tests {
         let mut s = Scraper::new();
         s.observe(&reading(1000, 10.0, 100.0));
 
-        // 5s after the last reading, at most 5_000 packets may be added.
+        // The whole allowance (60s at 1_000/s) can be spent at once...
         let inflated = reading(1000, 15.0, 1.0e12);
         let seen = s.observe(&inflated);
         assert!(seen.adjusted && !seen.restarted);
-        assert_eq!(s.offset.last_raw.packets_received, 5_100.0);
-        assert_eq!(s.live(&inflated).packets_received, 5_100.0);
-        // Values inside their ceiling are still taken as reported.
+        assert_eq!(s.offset.last_raw.packets_received, 60_100.0);
+        assert_eq!(s.live(&inflated).packets_received, 60_100.0);
+        // Values inside their allowance are still taken as reported.
         assert_eq!(s.offset.last_raw.uptime_seconds, 15.0);
 
+        // ...after which each 5s reading adds at most 5_000.
         s.observe(&inflated);
-        assert_eq!(s.offset.last_raw.packets_received, 10_100.0);
+        assert_eq!(s.offset.last_raw.packets_received, 65_100.0);
+        s.observe(&inflated);
+        assert_eq!(s.offset.last_raw.packets_received, 70_100.0);
     }
 
     #[test]
@@ -489,8 +524,10 @@ mod tests {
     fn capped_counts_stay_whole() {
         let mut s = Scraper::new();
         s.observe(&reading(1000, 10.0, 0.0));
-        s.observe_after(Duration::from_millis(5_700), &reading(1000, 15.0, 1.0e9));
-        assert_eq!(s.offset.last_raw.packets_received, 5_000.0);
+        s.observe(&reading(1000, 15.0, 1.0e9));
+        assert_eq!(s.offset.last_raw.packets_received, 60_000.0);
+        s.observe_after(Duration::from_millis(5_700), &reading(1000, 20.0, 1.0e9));
+        assert_eq!(s.offset.last_raw.packets_received, 65_000.0);
     }
 
     #[test]
@@ -552,8 +589,68 @@ mod tests {
             profitable_count: 1.0e6,
             ..Default::default()
         });
-        assert_eq!(s.offset.last_raw.cumulative_authorized_revenue_usd, 5.0);
-        assert_eq!(s.offset.last_raw.profitable_count, 50.0);
+        // 60s worth of allowance: $60 and 600 submissions.
+        assert_eq!(s.offset.last_raw.cumulative_authorized_revenue_usd, 60.0);
+        assert_eq!(s.offset.last_raw.profitable_count, 600.0);
+    }
+
+    /// Readings every 5s from a node that refreshes uptime every 30s and
+    /// forwards a little traffic, as live nodes do.
+    fn stepped_uptime_readings(start_uptime: f64, scrapes: u64) -> Vec<StructuredMetrics> {
+        (1..=scrapes)
+            .map(|i| {
+                let elapsed = (i * 5) as f64;
+                let uptime = start_uptime + (elapsed / 30.0).floor() * 30.0;
+                reading(1000, uptime, 1_000.0 + elapsed * 2.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn uptime_refreshed_in_30s_steps_is_taken_as_reported() {
+        let mut s = Scraper::new();
+        s.observe(&reading(1000, 0.0, 1_000.0));
+        for m in stepped_uptime_readings(0.0, 720) {
+            let seen = s.observe(&m);
+            assert_eq!(seen, Observation::default(), "uptime {}", m.uptime_seconds);
+            assert_eq!(s.offset.last_raw.uptime_seconds, m.uptime_seconds);
+        }
+    }
+
+    #[test]
+    fn uptime_refreshed_in_30s_steps_is_taken_as_reported_after_an_indexer_restart() {
+        // Offsets loaded from Postgres, node kept running through the deploy.
+        let mut s = Scraper::new();
+        s.offset = NodeOffset {
+            last_node_start_time: 1000,
+            last_raw: CumulativeMetrics {
+                uptime_seconds: 681_330.0,
+                packets_received: 1_000.0,
+                ..Default::default()
+            },
+            ..NodeOffset::default()
+        };
+        for m in stepped_uptime_readings(681_330.0, 720) {
+            assert_eq!(s.observe(&m), Observation::default());
+        }
+        assert_eq!(s.offset.last_raw.uptime_seconds, 681_330.0 + 3_600.0);
+    }
+
+    #[test]
+    fn sustained_growth_stays_within_the_rate_ceiling() {
+        let mut s = Scraper::new();
+        s.observe(&reading(1000, 0.0, 0.0));
+        // Uptime reported 6x faster than wall time for 10 minutes.
+        let mut reported = 0.0;
+        for _ in 0..120 {
+            reported += 30.0;
+            s.observe(&reading(1000, reported, 0.0));
+        }
+        // At most the full allowance (60s at 2/s) plus 2/s for 600s, against
+        // 3_600 reported.
+        let accepted = s.offset.last_raw.uptime_seconds;
+        assert!(accepted <= 120.0 + 1_200.0, "{accepted}");
+        assert!(accepted >= 1_200.0, "{accepted}");
     }
 
     #[test]
