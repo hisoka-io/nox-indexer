@@ -35,6 +35,16 @@ impl Db {
         Ok(Self { pool })
     }
 
+    /// A pool that never connects unless a query runs, for unit tests that
+    /// need an `AppState` but no database.
+    #[cfg(test)]
+    pub fn unconnected() -> Self {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://indexer@127.0.0.1:1/unused")
+            .expect("static test URL parses");
+        Self { pool }
+    }
+
     async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         let migration_files = [
             include_str!("../migrations/001_create_nodes.sql"),

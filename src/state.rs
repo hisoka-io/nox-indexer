@@ -329,6 +329,45 @@ impl AppState {
 }
 
 #[cfg(test)]
+impl AppState {
+    /// State with no chain, database or nodes behind it. Needs a Tokio runtime.
+    pub fn for_tests() -> Self {
+        let chain = ChainConfig::new(
+            &["http://127.0.0.1:1".to_string()],
+            "0x0000000000000000000000000000000000000001",
+            1,
+            0,
+            0,
+            None,
+            chain::LogChunkConfig {
+                initial: 1_000,
+                min: 10,
+                max: 10_000,
+            },
+        )
+        .expect("static test chain config is valid");
+        let (tx, _rx) = broadcast::channel(16);
+        Self {
+            chain: Arc::new(chain),
+            nodes: Arc::default(),
+            metrics: Arc::default(),
+            recent_events: Arc::default(),
+            topo_dedup: Arc::new(Mutex::new(TopoDedup::new())),
+            tx,
+            db: Db::unconnected(),
+            geo: None,
+            shutdown: CancellationToken::new(),
+            metric_offsets: Arc::default(),
+            sync: Arc::default(),
+            topology_version: Arc::default(),
+            seed_cache: Arc::default(),
+            probe_now: Arc::default(),
+            network_genesis_ms: Arc::default(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

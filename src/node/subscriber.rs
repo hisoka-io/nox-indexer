@@ -14,7 +14,19 @@ use crate::state::{AppState, NodeStatus, MAX_RECENT_EVENTS};
 
 const UPTIME_CONCURRENCY: usize = 20;
 
+/// Whether a node event may be kept in `recent_events` and sent to `/v1/live`.
+///
+/// Per-packet events are node-internal telemetry and are not republished.
+/// Traffic volume stays visible through the metric counters.
+pub fn is_republishable(event: &IngestEvent) -> bool {
+    !matches!(event, IngestEvent::PacketProcessed { .. })
+}
+
 pub fn process_event(state: &AppState, node_address: &str, event: &IngestEvent) {
+    if !is_republishable(event) {
+        return;
+    }
+
     let dedup_key = match event {
         IngestEvent::TopologyAdd { address, .. } => Some(format!("topo_add:{address}")),
         IngestEvent::TopologyRemove { address, .. } => Some(format!("topo_remove:{address}")),
@@ -457,4 +469,57 @@ async fn apply_status_change(state: &AppState, address: &str, reachable: bool) -
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    const NODE: &str = "0x1111111111111111111111111111111111111111";
+
+    #[tokio::test]
+    async fn per_packet_events_are_neither_stored_nor_republished() {
+        let state = AppState::for_tests();
+        let mut live = state.tx.subscribe();
+
+        process_event(
+            &state,
+            NODE,
+            &IngestEvent::PacketProcessed {
+                duration_ms: 42,
+                node_id: "nox-11111111".to_string(),
+            },
+        );
+        assert!(state.recent_events.read().is_empty());
+        assert!(matches!(live.try_recv(), Err(TryRecvError::Empty)));
+
+        process_event(
+            &state,
+            NODE,
+            &IngestEvent::PeerConnected {
+                peer_id: "peer".to_string(),
+                node_id: "nox-11111111".to_string(),
+            },
+        );
+        let recent = state.recent_events.read().clone();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["kind"], "peer_connected");
+        assert_eq!(recent[0]["node_address"], NODE);
+        let message: serde_json::Value =
+            serde_json::from_str(&live.try_recv().expect("event is published")).unwrap();
+        assert_eq!(message["type"], "EVENT");
+        assert_eq!(message["payload"]["kind"], "peer_connected");
+    }
+
+    #[test]
+    fn per_packet_events_still_parse() {
+        // Nodes keep sending them; they must be dropped quietly, not logged as
+        // parse errors on every packet.
+        let event: IngestEvent = serde_json::from_str(
+            r#"{"kind":"packet_processed","duration_ms":12,"node_id":"nox-1"}"#,
+        )
+        .unwrap();
+        assert!(!is_republishable(&event));
+    }
 }
