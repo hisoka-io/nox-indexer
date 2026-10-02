@@ -160,7 +160,7 @@ impl NodeState {
         let id = if info.address.len() >= 10 {
             format!("nox-{}", &info.address[2..10])
         } else {
-            format!("nox-{}", &info.address)
+            format!("nox-{}", info.address)
         };
 
         Self {
