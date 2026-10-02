@@ -22,10 +22,34 @@ pub fn is_republishable(event: &IngestEvent) -> bool {
     !matches!(event, IngestEvent::PacketProcessed { .. })
 }
 
+/// Check a membership change reported by a node against the registry state
+/// synced from chain. Returns the role to publish for an addition, `Some(None)`
+/// for a removal, or `None` when the address is not a known member (an addition
+/// must also still be registered).
+fn chain_view_of_topology_event(state: &AppState, event: &IngestEvent) -> Option<Option<u8>> {
+    let nodes = state.nodes.read();
+    match event {
+        IngestEvent::TopologyAdd { address, .. } => nodes
+            .get(&address.to_lowercase())
+            .filter(|node| node.status != NodeStatus::Deregistered)
+            .map(|node| Some(node.role)),
+        IngestEvent::TopologyRemove { address, .. } => {
+            nodes.get(&address.to_lowercase()).map(|_| None)
+        }
+        _ => Some(None),
+    }
+}
+
 pub fn process_event(state: &AppState, node_address: &str, event: &IngestEvent) {
     if !is_republishable(event) {
         return;
     }
+
+    // Membership changes are published only for registry members, with the
+    // role as synced from chain.
+    let Some(chain_role) = chain_view_of_topology_event(state, event) else {
+        return;
+    };
 
     let dedup_key = match event {
         IngestEvent::TopologyAdd { address, .. } => Some(format!("topo_add:{address}")),
@@ -44,6 +68,9 @@ pub fn process_event(state: &AppState, node_address: &str, event: &IngestEvent) 
                 "node_address".into(),
                 serde_json::Value::String(node_address.to_string()),
             );
+            if let Some(role) = chain_role {
+                obj.insert("role".into(), serde_json::Value::from(role));
+            }
         }
         {
             let mut buffer = state.recent_events.write();
@@ -552,6 +579,50 @@ mod tests {
             serde_json::from_str(&live.try_recv().expect("event is published")).unwrap();
         assert_eq!(message["type"], "EVENT");
         assert_eq!(message["payload"]["kind"], "peer_connected");
+    }
+
+    #[tokio::test]
+    async fn membership_events_are_published_only_for_registry_members() {
+        let state = AppState::for_tests();
+        let departed = "0x2222222222222222222222222222222222222222";
+        let unknown = "0x3333333333333333333333333333333333333333";
+        {
+            let mut nodes = state.nodes.write();
+            nodes.insert(NODE.to_string(), member(NODE, NodeStatus::Online));
+            nodes.insert(
+                departed.to_string(),
+                member(departed, NodeStatus::Deregistered),
+            );
+        }
+        let add = |address: &str, role: u8| IngestEvent::TopologyAdd {
+            address: address.to_string(),
+            role,
+            stake: "0".to_string(),
+            node_id: "nox-reporter".to_string(),
+        };
+        let remove = |address: &str| IngestEvent::TopologyRemove {
+            address: address.to_string(),
+            node_id: "nox-reporter".to_string(),
+        };
+
+        process_event(&state, NODE, &add(unknown, 2));
+        process_event(&state, NODE, &add(departed, 2));
+        process_event(&state, NODE, &remove(unknown));
+        assert!(state.recent_events.read().is_empty());
+
+        // A member's addition carries the registry role, whatever was reported.
+        process_event(
+            &state,
+            NODE,
+            &add(&NODE.to_uppercase().replace("0X", "0x"), 2),
+        );
+        process_event(&state, NODE, &remove(departed));
+        let recent = state.recent_events.read().clone();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["kind"], "topology_add");
+        assert_eq!(recent[0]["role"], 1);
+        assert_eq!(recent[1]["kind"], "topology_remove");
+        assert_eq!(recent[1]["address"], departed);
     }
 
     #[test]
