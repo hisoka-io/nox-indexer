@@ -298,6 +298,7 @@ pub fn public_error_summary(error: &str) -> &'static str {
     if [
         "load checkpoint",
         "load registry members",
+        "load settlement",
         "persist ",
         "deregister stale",
     ]
@@ -319,7 +320,7 @@ pub fn public_error_summary(error: &str) -> &'static str {
     }
 }
 
-fn serialize_public_error<S: serde::Serializer>(
+pub(crate) fn serialize_public_error<S: serde::Serializer>(
     error: &Option<String>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
@@ -363,6 +364,8 @@ pub struct AppState {
     pub network_genesis_ms: Arc<RwLock<Option<i64>>>,
     /// Sync age above which `/healthz/sync` reports the indexer as stale.
     pub max_sync_age_secs: u64,
+    /// Paid execution settlements and exit credit claims (off unless configured).
+    pub settlements: Arc<RwLock<crate::chain::settlement::SettlementStatus>>,
 }
 
 impl AppState {

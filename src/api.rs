@@ -2,11 +2,11 @@ use axum::http::StatusCode;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
     response::IntoResponse,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
@@ -191,6 +191,7 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
 
     let indexer = state.sync.read().clone();
     let genesis = *state.network_genesis_ms.read();
+    let settlements = state.settlements.read().clone();
 
     axum::Json(json!({
         "nodes": nodes,
@@ -201,7 +202,70 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
         "network_genesis_ms": genesis,
         "network_reputation_avg": reputation_avg,
         "indexer": indexer,
+        "settlements": settlements,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct SettlementQuery {
+    limit: Option<u32>,
+}
+
+const SETTLEMENT_LIMIT_DEFAULT: u32 = 50;
+const SETTLEMENT_LIMIT_MAX: u32 = 500;
+
+/// Settlement totals plus the most recent settlements and exit credit claims.
+pub async fn handle_get_settlements(
+    State(state): State<AppState>,
+    Query(query): Query<SettlementQuery>,
+) -> impl IntoResponse {
+    let status = state.settlements.read().clone();
+    let chain_id = state.sync.read().chain_id;
+    let limit = i64::from(
+        query
+            .limit
+            .unwrap_or(SETTLEMENT_LIMIT_DEFAULT)
+            .clamp(1, SETTLEMENT_LIMIT_MAX),
+    );
+
+    let mut recent = Vec::new();
+    let mut recent_claims = Vec::new();
+    if let (Some(chain_id), Some(entry_point)) = (chain_id, status.entry_point.as_deref()) {
+        let settlements = state
+            .db
+            .recent_paid_settlements(chain_id, entry_point, limit)
+            .await;
+        let claims = match status.reward_pool.as_deref() {
+            Some(pool) => {
+                state
+                    .db
+                    .recent_exit_credit_claims(chain_id, pool, limit)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        };
+        match (settlements, claims) {
+            (Ok(settlements), Ok(claims)) => {
+                recent = settlements;
+                recent_claims = claims;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::error!("Failed to query settlements: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({ "error": "Failed to query settlements" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut body = serde_json::to_value(&status).unwrap_or_else(|_| json!({}));
+    if let Some(object) = body.as_object_mut() {
+        object.insert("recent".to_string(), json!(recent));
+        object.insert("recent_claims".to_string(), json!(recent_claims));
+    }
+    axum::Json(body).into_response()
 }
 
 pub async fn handle_ws_upgrade(

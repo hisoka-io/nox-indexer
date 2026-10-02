@@ -66,6 +66,19 @@ pub struct Args {
     )]
     pub geoip_db_path: String,
 
+    /// NoxEntryPoint address; when set, paid execution settlements are indexed
+    #[arg(long, env = "ENTRY_POINT_ADDRESS")]
+    pub entry_point_address: Option<String>,
+
+    /// NoxRewardPool address; when set with ENTRY_POINT_ADDRESS, exit credit
+    /// claims and pool balances are indexed too
+    #[arg(long, env = "REWARD_POOL_ADDRESS")]
+    pub reward_pool_address: Option<String>,
+
+    /// First block scanned for settlements (default: FROM_BLOCK)
+    #[arg(long, env = "SETTLEMENT_FROM_BLOCK")]
+    pub settlement_from_block: Option<u64>,
+
     /// Poll node addresses that are loopback or private (always on for localtestnet)
     #[arg(long, env = "ALLOW_PRIVATE_NODE_ADDRESSES", default_value_t = false)]
     pub allow_private_node_addresses: bool,
@@ -142,6 +155,9 @@ mod tests {
             geoip_db_path: "./assets/GeoLite2-City.mmdb".to_string(),
             health_max_sync_age_secs: 300,
             allow_private_node_addresses: false,
+            entry_point_address: None,
+            reward_pool_address: None,
+            settlement_from_block: None,
         }
     }
 

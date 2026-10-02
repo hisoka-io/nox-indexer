@@ -62,12 +62,29 @@ async fn main() {
         }),
     );
 
+    let settlement_config = chain::settlement::SettlementConfig::new(
+        args.entry_point_address.as_deref(),
+        args.reward_pool_address.as_deref(),
+        args.settlement_from_block.unwrap_or(net_config.from_block),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Settlement config error: {e}");
+        std::process::exit(1);
+    });
+
     let shutdown = CancellationToken::new();
     install_shutdown_handler(shutdown.clone());
 
     let state = init_state(&args, chain_config.clone(), shutdown).await;
 
-    let handles = spawn_background_tasks(&state, &chain_config, args.uptime_check_interval);
+    let mut handles = spawn_background_tasks(&state, &chain_config, args.uptime_check_interval);
+    if let Some(config) = settlement_config {
+        let s = state.clone();
+        let c = chain_config.clone();
+        handles.push(tokio::spawn(async move {
+            chain::settlement::run_settlement_sync(s, c, config).await
+        }));
+    }
 
     serve_http(state, args.port, &net_config, &args).await;
 
@@ -195,6 +212,7 @@ async fn init_state(
         probe_now: Arc::new(tokio::sync::Notify::new()),
         network_genesis_ms: Arc::new(RwLock::new(network_genesis_ms)),
         max_sync_age_secs: args.health_max_sync_age_secs,
+        settlements: Arc::new(RwLock::new(Default::default())),
     }
 }
 
@@ -293,6 +311,10 @@ async fn serve_http(state: AppState, port: u16, net_config: &NetworkConfig, args
         .route(
             "/healthz/sync",
             axum::routing::get(api::handle_healthz_sync),
+        )
+        .route(
+            "/v1/settlements",
+            axum::routing::get(api::handle_get_settlements),
         )
         .layer(cors)
         .with_state(state.clone());

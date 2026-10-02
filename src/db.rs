@@ -4,8 +4,12 @@ use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+use crate::chain::settlement::{
+    ClaimedTotalsRow, ExitCreditClaim, PaidSettlement, SettledTotalsRow,
+};
 use crate::node::offsets::{CumulativeMetrics, NodeOffset};
 use crate::state::{NodeState, NodeStatus};
+use ethers::types::Address;
 
 const EMA_ALPHA: f64 = 0.01;
 
@@ -42,6 +46,7 @@ impl Db {
             include_str!("../migrations/003_add_ingress_metadata_url.sql"),
             include_str!("../migrations/004_metric_offsets.sql"),
             include_str!("../migrations/005_registry_checkpoints.sql"),
+            include_str!("../migrations/006_paid_settlements.sql"),
         ];
 
         for file in migration_files {
@@ -419,6 +424,289 @@ impl Db {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|(value,)| value))
+    }
+}
+
+/// Paid execution settlements and exit credit claims.
+impl Db {
+    fn chain_key(chain_id: u64) -> i64 {
+        i64::try_from(chain_id).unwrap_or(i64::MAX)
+    }
+
+    fn address_key(address: Address) -> String {
+        format!("{address:?}").to_lowercase()
+    }
+
+    pub async fn get_settlement_checkpoint(
+        &self,
+        chain_id: u64,
+        source: &str,
+    ) -> Result<Option<u64>, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT last_block FROM settlement_checkpoints WHERE chain_id = $1 AND source = $2",
+        )
+        .bind(Self::chain_key(chain_id))
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(block,)| u64::try_from(block).ok()))
+    }
+
+    pub async fn set_settlement_checkpoint(
+        &self,
+        chain_id: u64,
+        source: &str,
+        block: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO settlement_checkpoints (chain_id, source, last_block, updated_at_ms)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (chain_id, source) DO UPDATE SET
+                 last_block = EXCLUDED.last_block,
+                 updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(Self::chain_key(chain_id))
+        .bind(source)
+        .bind(i64::try_from(block).unwrap_or(i64::MAX))
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Store a settlement once. Returns false when the log was already stored.
+    pub async fn insert_paid_settlement(
+        &self,
+        chain_id: u64,
+        entry_point: Address,
+        settlement: &PaidSettlement,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO paid_settlements
+                 (chain_id, tx_hash, log_index, block_number, block_timestamp, entry_point,
+                  execution_id, payment_id, exit_address, fee_asset, exit_fee, network_fee,
+                  action_target, action_success)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::numeric, $12::numeric,
+                     $13, $14)
+             ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+        )
+        .bind(Self::chain_key(chain_id))
+        .bind(&settlement.tx_hash)
+        .bind(i64::try_from(settlement.log_index).unwrap_or(i64::MAX))
+        .bind(i64::try_from(settlement.block_number).unwrap_or(i64::MAX))
+        .bind(i64::try_from(settlement.block_timestamp).unwrap_or(i64::MAX))
+        .bind(Self::address_key(entry_point))
+        .bind(&settlement.execution_id)
+        .bind(&settlement.payment_id)
+        .bind(&settlement.exit_address)
+        .bind(&settlement.fee_asset)
+        .bind(&settlement.exit_fee)
+        .bind(&settlement.network_fee)
+        .bind(&settlement.action_target)
+        .bind(settlement.action_success)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Store a claim once. Returns false when the log was already stored.
+    pub async fn insert_exit_credit_claim(
+        &self,
+        chain_id: u64,
+        reward_pool: Address,
+        claim: &ExitCreditClaim,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO exit_credit_claims
+                 (chain_id, tx_hash, log_index, block_number, block_timestamp, reward_pool,
+                  exit_address, recipient, asset, amount)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::numeric)
+             ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+        )
+        .bind(Self::chain_key(chain_id))
+        .bind(&claim.tx_hash)
+        .bind(i64::try_from(claim.log_index).unwrap_or(i64::MAX))
+        .bind(i64::try_from(claim.block_number).unwrap_or(i64::MAX))
+        .bind(i64::try_from(claim.block_timestamp).unwrap_or(i64::MAX))
+        .bind(Self::address_key(reward_pool))
+        .bind(&claim.exit_address)
+        .bind(&claim.recipient)
+        .bind(&claim.asset)
+        .bind(&claim.amount)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn paid_settlement_totals(
+        &self,
+        chain_id: u64,
+        entry_point: Address,
+    ) -> Result<Vec<SettledTotalsRow>, sqlx::Error> {
+        let rows: Vec<(String, String, i64, String, String)> = sqlx::query_as(
+            "SELECT exit_address, fee_asset, COUNT(*)::bigint,
+                    SUM(exit_fee)::text, SUM(network_fee)::text
+             FROM paid_settlements
+             WHERE chain_id = $1 AND entry_point = $2
+             GROUP BY exit_address, fee_asset",
+        )
+        .bind(Self::chain_key(chain_id))
+        .bind(Self::address_key(entry_point))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(exit_address, fee_asset, executions, exit_fees, network_fees)| SettledTotalsRow {
+                    exit_address,
+                    fee_asset,
+                    executions,
+                    exit_fees,
+                    network_fees,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn exit_credit_claim_totals(
+        &self,
+        chain_id: u64,
+        reward_pool: Address,
+    ) -> Result<Vec<ClaimedTotalsRow>, sqlx::Error> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT exit_address, asset, SUM(amount)::text
+             FROM exit_credit_claims
+             WHERE chain_id = $1 AND reward_pool = $2
+             GROUP BY exit_address, asset",
+        )
+        .bind(Self::chain_key(chain_id))
+        .bind(Self::address_key(reward_pool))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(exit_address, asset, claimed)| ClaimedTotalsRow {
+                exit_address,
+                asset,
+                claimed,
+            })
+            .collect())
+    }
+
+    /// Newest settlements first.
+    pub async fn recent_paid_settlements(
+        &self,
+        chain_id: u64,
+        entry_point: &str,
+        limit: i64,
+    ) -> Result<Vec<PaidSettlement>, sqlx::Error> {
+        type Row = (
+            String,
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            bool,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT tx_hash, log_index, block_number, block_timestamp, execution_id, payment_id,
+                    exit_address, fee_asset, exit_fee::text, network_fee::text, action_target,
+                    action_success
+             FROM paid_settlements
+             WHERE chain_id = $1 AND entry_point = $2
+             ORDER BY block_number DESC, log_index DESC
+             LIMIT $3",
+        )
+        .bind(Self::chain_key(chain_id))
+        .bind(entry_point.to_lowercase())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    tx_hash,
+                    log_index,
+                    block_number,
+                    block_timestamp,
+                    execution_id,
+                    payment_id,
+                    exit_address,
+                    fee_asset,
+                    exit_fee,
+                    network_fee,
+                    action_target,
+                    action_success,
+                )| PaidSettlement {
+                    tx_hash,
+                    log_index: u64::try_from(log_index).unwrap_or_default(),
+                    block_number: u64::try_from(block_number).unwrap_or_default(),
+                    block_timestamp: u64::try_from(block_timestamp).unwrap_or_default(),
+                    execution_id,
+                    payment_id,
+                    exit_address,
+                    fee_asset,
+                    exit_fee,
+                    network_fee,
+                    action_target,
+                    action_success,
+                },
+            )
+            .collect())
+    }
+
+    /// Newest claims first.
+    pub async fn recent_exit_credit_claims(
+        &self,
+        chain_id: u64,
+        reward_pool: &str,
+        limit: i64,
+    ) -> Result<Vec<ExitCreditClaim>, sqlx::Error> {
+        type Row = (String, i64, i64, i64, String, String, String, String);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT tx_hash, log_index, block_number, block_timestamp, exit_address, recipient,
+                    asset, amount::text
+             FROM exit_credit_claims
+             WHERE chain_id = $1 AND reward_pool = $2
+             ORDER BY block_number DESC, log_index DESC
+             LIMIT $3",
+        )
+        .bind(Self::chain_key(chain_id))
+        .bind(reward_pool.to_lowercase())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    tx_hash,
+                    log_index,
+                    block_number,
+                    block_timestamp,
+                    exit_address,
+                    recipient,
+                    asset,
+                    amount,
+                )| ExitCreditClaim {
+                    tx_hash,
+                    log_index: u64::try_from(log_index).unwrap_or_default(),
+                    block_number: u64::try_from(block_number).unwrap_or_default(),
+                    block_timestamp: u64::try_from(block_timestamp).unwrap_or_default(),
+                    exit_address,
+                    recipient,
+                    asset,
+                    amount,
+                },
+            )
+            .collect())
     }
 }
 
