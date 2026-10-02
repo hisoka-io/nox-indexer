@@ -139,6 +139,13 @@ async fn scrape_node_metrics(
                 match client.get(&metrics_url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<StructuredMetrics>().await {
+                            // The scraper can outlive a removal by one tick;
+                            // only current members feed the totals.
+                            Ok(_) if !is_registered_member(&state, &node_address) => {
+                                tracing::debug!(
+                                    "Ignoring metrics from {node_address}: not a registered member"
+                                );
+                            }
                             Ok(mut parsed) => {
                                 apply_lifetime_offsets(&state, &node_address, &mut parsed).await;
                                 state.metrics.write().insert(node_address.clone(), parsed.clone());
@@ -173,20 +180,36 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn is_registered_member(state: &AppState, address: &str) -> bool {
+    state
+        .nodes
+        .read()
+        .get(address)
+        .is_some_and(|node| node.status != NodeStatus::Deregistered)
+}
+
 /// Fold banked lifetime totals into a freshly scraped reading.
 ///
 /// Detects a node restart, banks the previous incarnation's final counters, then
-/// adds the running total onto `parsed` so the dashboard sees a continuous
-/// lifetime figure. The write lock is released before any DB call.
+/// replaces the counters in `parsed` with the node's accepted lifetime totals so
+/// the dashboard sees a continuous figure. The write lock is released before
+/// any DB call.
 async fn apply_lifetime_offsets(state: &AppState, address: &str, parsed: &mut StructuredMetrics) {
     let banked_snapshot = {
         let mut map = state.metric_offsets.write();
         let offset = map.entry(address.to_string()).or_default();
         // Observe the raw reading first; applying before observing would fold
         // previously banked totals back into last_raw and double-count them.
-        let restarted = offset.observe(parsed);
+        let seen = offset.observe(parsed, std::time::Instant::now());
         offset.apply(parsed);
-        if restarted {
+        if seen.adjusted && !offset.adjusting {
+            tracing::warn!(
+                "Node {address} reported counters that went backwards or grew faster \
+                 than the accepted rate; holding or capping them"
+            );
+        }
+        offset.adjusting = seen.adjusted;
+        if seen.restarted {
             Some(offset.clone())
         } else {
             None
@@ -474,9 +497,28 @@ async fn apply_status_change(state: &AppState, address: &str, reachable: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::NodeState;
     use tokio::sync::broadcast::error::TryRecvError;
 
     const NODE: &str = "0x1111111111111111111111111111111111111111";
+
+    fn member(address: &str, status: NodeStatus) -> NodeState {
+        let mut node = NodeState::from_chain_info(
+            &crate::chain::OnChainNode {
+                address: address.to_string(),
+                url: "/ip4/127.0.0.1/tcp/9000".to_string(),
+                ingress_url: String::new(),
+                metadata_url: String::new(),
+                sphinx_key: "11".repeat(32),
+                role: 1,
+                frozen: false,
+            },
+            421_614,
+            "0xabc",
+        );
+        node.status = status;
+        node
+    }
 
     #[tokio::test]
     async fn per_packet_events_are_neither_stored_nor_republished() {
@@ -521,5 +563,54 @@ mod tests {
         )
         .unwrap();
         assert!(!is_republishable(&event));
+    }
+
+    #[tokio::test]
+    async fn only_registered_members_feed_metrics() {
+        let state = AppState::for_tests();
+        let departed = "0x2222222222222222222222222222222222222222";
+        {
+            let mut nodes = state.nodes.write();
+            nodes.insert(NODE.to_string(), member(NODE, NodeStatus::Offline));
+            nodes.insert(
+                departed.to_string(),
+                member(departed, NodeStatus::Deregistered),
+            );
+        }
+
+        assert!(is_registered_member(&state, NODE));
+        assert!(!is_registered_member(&state, departed));
+        assert!(!is_registered_member(
+            &state,
+            "0x3333333333333333333333333333333333333333"
+        ));
+    }
+
+    #[tokio::test]
+    async fn scraped_counters_are_bounded_before_they_reach_the_totals() {
+        let state = AppState::for_tests();
+        let mut first = StructuredMetrics {
+            node_start_time: 1_000.0,
+            packets_received: 10.0,
+            ..Default::default()
+        };
+        apply_lifetime_offsets(&state, NODE, &mut first).await;
+        assert_eq!(first.packets_received, 10.0);
+
+        let mut inflated = StructuredMetrics {
+            node_start_time: 1_000.0,
+            packets_received: 1.0e15,
+            ..Default::default()
+        };
+        apply_lifetime_offsets(&state, NODE, &mut inflated).await;
+        assert!(
+            inflated.packets_received < 1.0e5,
+            "{}",
+            inflated.packets_received
+        );
+        assert!(state.metric_offsets.read()[NODE].adjusting);
+
+        let totals = crate::node::offsets::network_totals(state.metric_offsets.read().values());
+        assert_eq!(totals.packets_received, inflated.packets_received);
     }
 }

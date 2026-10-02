@@ -284,7 +284,7 @@ impl Db {
                     last_node_start_time,
                     banked,
                     last_raw,
-                    dirty: false,
+                    ..NodeOffset::default()
                 },
             );
         }
