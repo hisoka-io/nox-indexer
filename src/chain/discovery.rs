@@ -506,6 +506,9 @@ async fn chain_event_loop(
                 }
             }
         }
+        if last_block >= target {
+            state.mark_caught_up(last_block, target);
+        }
         if changed {
             state.bump_topology_version();
         }

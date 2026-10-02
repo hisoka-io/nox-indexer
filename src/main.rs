@@ -191,6 +191,7 @@ async fn init_state(
         seed_cache: Arc::new(tokio::sync::Mutex::new(None)),
         probe_now: Arc::new(tokio::sync::Notify::new()),
         network_genesis_ms: Arc::new(RwLock::new(network_genesis_ms)),
+        max_sync_age_secs: args.health_max_sync_age_secs,
     }
 }
 
@@ -286,6 +287,10 @@ async fn serve_http(state: AppState, port: u16, net_config: &NetworkConfig, args
             axum::routing::get(api::handle_seed_topology),
         )
         .route("/healthz", axum::routing::get(api::handle_healthz))
+        .route(
+            "/healthz/sync",
+            axum::routing::get(api::handle_healthz_sync),
+        )
         .layer(cors)
         .with_state(state.clone());
 

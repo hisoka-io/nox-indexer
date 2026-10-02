@@ -230,7 +230,58 @@ pub struct SyncStatus {
     /// and provider errors can carry keyed hostnames or internal addresses.
     #[serde(serialize_with = "serialize_public_error")]
     pub last_error: Option<String>,
+    /// When (Unix ms) every registry event up to the safe head was last
+    /// applied. Advances on every live poll, so its age measures sync lag.
     pub last_synced_at_ms: Option<i64>,
+    /// Safe head (latest block minus confirmations) seen by the last poll.
+    pub head_block: Option<u64>,
+}
+
+/// Why the chain sync is not healthy, for monitors. Static text only: the
+/// response is public.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncUnhealthy {
+    NotLive,
+    NeverSynced,
+    Stale,
+    Unverified,
+}
+
+impl SyncUnhealthy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncUnhealthy::NotLive => "chain sync is not live",
+            SyncUnhealthy::NeverSynced => "chain sync has not completed",
+            SyncUnhealthy::Stale => "chain sync is stale",
+            SyncUnhealthy::Unverified => "membership disagrees with the registry",
+        }
+    }
+}
+
+impl SyncStatus {
+    /// Seconds since every event up to the safe head was last applied.
+    pub fn sync_age_secs(&self, now_ms: i64) -> Option<u64> {
+        self.last_synced_at_ms
+            .map(|at| u64::try_from(now_ms.saturating_sub(at)).unwrap_or(0) / 1_000)
+    }
+
+    /// Whether the indexer is following the chain closely enough to serve
+    /// fresh seed snapshots.
+    pub fn check_health(&self, now_ms: i64, max_age_secs: u64) -> Result<(), SyncUnhealthy> {
+        if self.phase != SyncPhase::Live {
+            return Err(SyncUnhealthy::NotLive);
+        }
+        let age = self
+            .sync_age_secs(now_ms)
+            .ok_or(SyncUnhealthy::NeverSynced)?;
+        if age > max_age_secs {
+            return Err(SyncUnhealthy::Stale);
+        }
+        if self.verified == Some(false) {
+            return Err(SyncUnhealthy::Unverified);
+        }
+        Ok(())
+    }
 }
 
 /// A public, secret-free description of a chain sync error. The full error is
@@ -307,6 +358,8 @@ pub struct AppState {
     pub probe_now: Arc<Notify>,
     /// Earliest evidence of the network (first uptime check), in Unix ms.
     pub network_genesis_ms: Arc<RwLock<Option<i64>>>,
+    /// Sync age above which `/healthz/sync` reports the indexer as stale.
+    pub max_sync_age_secs: u64,
 }
 
 impl AppState {
@@ -326,6 +379,16 @@ impl AppState {
         sync.verified = Some(verified);
         sync.attempts = 0;
         sync.last_error = None;
+        sync.last_synced_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        sync.head_block = Some(block);
+    }
+
+    /// The live loop has applied every registry event up to the safe head.
+    pub fn mark_caught_up(&self, last_block: u64, safe_head: u64) {
+        let mut sync = self.sync.write();
+        sync.last_block = Some(last_block);
+        sync.scan_block = Some(last_block);
+        sync.head_block = Some(safe_head);
         sync.last_synced_at_ms = Some(chrono::Utc::now().timestamp_millis());
     }
 }
@@ -367,6 +430,46 @@ mod tests {
         );
         let none = serde_json::to_value(SyncStatus::default()).unwrap();
         assert!(none["last_error"].is_null());
+    }
+
+    fn live_status(synced_at_ms: i64) -> SyncStatus {
+        SyncStatus {
+            phase: SyncPhase::Live,
+            last_block: Some(10),
+            verified: Some(true),
+            last_synced_at_ms: Some(synced_at_ms),
+            ..SyncStatus::default()
+        }
+    }
+
+    #[test]
+    fn sync_health_tracks_the_age_of_the_last_caught_up_poll() {
+        let now = 1_000_000_000;
+        assert_eq!(live_status(now - 30_000).check_health(now, 300), Ok(()));
+        assert_eq!(live_status(now - 30_000).sync_age_secs(now), Some(30));
+        assert_eq!(
+            live_status(now - 301_000).check_health(now, 300),
+            Err(SyncUnhealthy::Stale)
+        );
+        let mut retrying = live_status(now);
+        retrying.phase = SyncPhase::Retrying;
+        assert_eq!(retrying.check_health(now, 300), Err(SyncUnhealthy::NotLive));
+        let mut mismatched = live_status(now);
+        mismatched.verified = Some(false);
+        assert_eq!(
+            mismatched.check_health(now, 300),
+            Err(SyncUnhealthy::Unverified)
+        );
+        let mut fresh = live_status(now);
+        fresh.last_synced_at_ms = None;
+        assert_eq!(
+            fresh.check_health(now, 300),
+            Err(SyncUnhealthy::NeverSynced)
+        );
+        assert_eq!(
+            SyncStatus::default().check_health(now, 300),
+            Err(SyncUnhealthy::NotLive)
+        );
     }
 
     #[test]

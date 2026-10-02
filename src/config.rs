@@ -65,6 +65,10 @@ pub struct Args {
         default_value = "./assets/GeoLite2-City.mmdb"
     )]
     pub geoip_db_path: String,
+
+    /// Seconds without a caught-up chain poll before `/healthz/sync` returns 503
+    #[arg(long, env = "HEALTH_MAX_SYNC_AGE_SECS", default_value = "300")]
+    pub health_max_sync_age_secs: u64,
 }
 
 pub struct NetworkConfig {
@@ -132,6 +136,7 @@ mod tests {
             database_url: "postgres://localhost/indexer".to_string(),
             uptime_check_interval: 60,
             geoip_db_path: "./assets/GeoLite2-City.mmdb".to_string(),
+            health_max_sync_age_secs: 300,
         }
     }
 

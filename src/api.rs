@@ -61,10 +61,11 @@ struct SeedTopologySnapshot {
 /// the platform healthcheck. Chain progress is reported in the body.
 pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse {
     let chain = state.sync.read().clone();
+    let sync_age_secs = chain.sync_age_secs(chrono::Utc::now().timestamp_millis());
     match state.db.ping().await {
         Ok(()) => (
             axum::http::StatusCode::OK,
-            axum::Json(json!({ "status": "ok", "chain": chain })),
+            axum::Json(json!({ "status": "ok", "sync_age_secs": sync_age_secs, "chain": chain })),
         )
             .into_response(),
         Err(e) => {
@@ -72,13 +73,53 @@ pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse 
             tracing::warn!("Healthcheck database ping failed: {e}");
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(
-                    json!({ "status": "degraded", "error": "database unavailable", "chain": chain }),
-                ),
+                axum::Json(json!({
+                    "status": "degraded",
+                    "error": "database unavailable",
+                    "sync_age_secs": sync_age_secs,
+                    "chain": chain,
+                })),
             )
                 .into_response()
         }
     }
+}
+
+/// For uptime monitors: 200 only when Postgres answers and the chain sync is
+/// live, verified and caught up within `HEALTH_MAX_SYNC_AGE_SECS`. Not used as
+/// the platform healthcheck, because a long replay after a deploy would fail it.
+pub async fn handle_healthz_sync(State(state): State<AppState>) -> impl IntoResponse {
+    let chain = state.sync.read().clone();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let sync_age_secs = chain.sync_age_secs(now_ms);
+    let max_sync_age_secs = state.max_sync_age_secs;
+
+    let problem = match state.db.ping().await {
+        Err(e) => {
+            tracing::warn!("Sync healthcheck database ping failed: {e}");
+            Some("database unavailable")
+        }
+        Ok(()) => chain
+            .check_health(now_ms, max_sync_age_secs)
+            .err()
+            .map(|reason| reason.as_str()),
+    };
+
+    let (code, status) = match problem {
+        None => (StatusCode::OK, "ok"),
+        Some(_) => (StatusCode::SERVICE_UNAVAILABLE, "unhealthy"),
+    };
+    (
+        code,
+        axum::Json(json!({
+            "status": status,
+            "error": problem,
+            "sync_age_secs": sync_age_secs,
+            "max_sync_age_secs": max_sync_age_secs,
+            "chain": chain,
+        })),
+    )
+        .into_response()
 }
 
 pub async fn handle_get_reputation(State(state): State<AppState>) -> impl IntoResponse {
