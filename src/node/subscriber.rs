@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::broadcast::{broadcast_cluster_snapshot, broadcast_event, broadcast_metrics};
 use crate::node::events::IngestEvent;
-use crate::node::metrics::StructuredMetrics;
+use crate::node::metrics::{StructuredMetrics, NODE_VERSION_HEADER};
 use crate::node::offsets::NodeOffset;
 use crate::node::targets::{node_http_client, url_allowed};
 use crate::state::{AppState, NodeStatus, MAX_RECENT_EVENTS};
@@ -207,8 +207,14 @@ async fn scrape_node_metrics(
             _ = interval.tick() => {
                 match client.get(&metrics_url).send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        let header_version = resp
+                            .headers()
+                            .get(NODE_VERSION_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
                         match resp.json::<StructuredMetrics>().await {
                             Ok(mut parsed) => {
+                                parsed.fill_build_version(header_version.as_deref());
                                 apply_lifetime_offsets(&state, &node_address, &mut parsed).await;
                                 state.metrics.write().insert(node_address.clone(), parsed.clone());
                                 broadcast_metrics(&state, &node_address, &parsed);
