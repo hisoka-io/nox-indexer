@@ -38,6 +38,9 @@ async fn main() {
         eprintln!("Config error: {e}");
         std::process::exit(1);
     });
+    node::targets::set_private_targets_allowed(
+        args.network == "localtestnet" || args.allow_private_node_addresses,
+    );
 
     let chain_config = Arc::new(
         chain::ChainConfig::new(

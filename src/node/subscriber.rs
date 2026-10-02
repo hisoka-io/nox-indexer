@@ -12,6 +12,7 @@ use crate::broadcast::{broadcast_cluster_snapshot, broadcast_event, broadcast_me
 use crate::node::events::IngestEvent;
 use crate::node::metrics::StructuredMetrics;
 use crate::node::offsets::NodeOffset;
+use crate::node::targets::{node_http_client, url_allowed};
 use crate::state::{AppState, NodeStatus, MAX_RECENT_EVENTS};
 
 const UPTIME_CONCURRENCY: usize = 20;
@@ -35,10 +36,7 @@ struct TopoSnapshot {
 }
 
 async fn sync_topology_from_node(state: &AppState, base_url: &str) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    let client = node_http_client(Some(Duration::from_secs(5)));
 
     let url = format!("{base_url}/topology");
     match client.get(&url).send().await {
@@ -130,6 +128,7 @@ async fn subscribe_node_events(
     cancel: CancellationToken,
 ) {
     let url = format!("{base_url}/events");
+    let client = node_http_client(None);
 
     loop {
         if cancel.is_cancelled() {
@@ -137,7 +136,13 @@ async fn subscribe_node_events(
         }
 
         tracing::info!("SSE connecting to {node_address} at {url}");
-        let mut es = EventSource::get(&url);
+        let mut es = match EventSource::new(client.get(&url)) {
+            Ok(es) => es,
+            Err(error) => {
+                tracing::warn!("SSE request for {node_address} could not be built: {error}");
+                return;
+            }
+        };
 
         loop {
             tokio::select! {
@@ -189,10 +194,7 @@ async fn scrape_node_metrics(
     base_url: String,
     cancel: CancellationToken,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    let client = node_http_client(Some(Duration::from_secs(5)));
     let metrics_url = format!("{base_url}/metrics/json");
     let mut interval = tokio::time::interval(Duration::from_secs(5));
 
@@ -331,13 +333,14 @@ struct ActiveNodeSub {
 }
 
 fn resolve_base_url(admin_url: &str, admin_port: u16) -> Option<String> {
-    if !admin_url.is_empty() {
-        Some(admin_url.to_string())
+    let url = if !admin_url.is_empty() {
+        admin_url.to_string()
     } else if admin_port > 0 {
-        Some(format!("http://127.0.0.1:{admin_port}"))
+        format!("http://127.0.0.1:{admin_port}")
     } else {
-        None
-    }
+        return None;
+    };
+    url_allowed(&url).then_some(url)
 }
 
 pub async fn manage_subscriptions(state: AppState) {
@@ -427,10 +430,7 @@ pub async fn manage_subscriptions(state: AppState) {
 }
 
 pub async fn uptime_check_loop(state: AppState, interval_secs: u64) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    let client = node_http_client(Some(Duration::from_secs(5)));
 
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
@@ -458,6 +458,11 @@ pub async fn uptime_check_loop(state: AppState, interval_secs: u64) {
             .map(|(address, admin_url)| {
                 let client = client.clone();
                 async move {
+                    // Rows written by older builds may hold an address that is
+                    // no longer polled: count it as unreachable.
+                    if !url_allowed(&admin_url) {
+                        return (address, false);
+                    }
                     let metrics_url = format!("{admin_url}/metrics/json");
                     let reachable = client
                         .get(&metrics_url)
@@ -565,7 +570,7 @@ pub async fn periodic_topology_sync(state: AppState) {
             let nodes = state.nodes.read();
             nodes
                 .values()
-                .find(|n| n.status == NodeStatus::Online && !n.admin_url.is_empty())
+                .find(|n| n.status == NodeStatus::Online && url_allowed(&n.admin_url))
                 .map(|n| n.admin_url.clone())
         };
 

@@ -66,6 +66,10 @@ pub struct Args {
     )]
     pub geoip_db_path: String,
 
+    /// Poll node addresses that are loopback or private (always on for localtestnet)
+    #[arg(long, env = "ALLOW_PRIVATE_NODE_ADDRESSES", default_value_t = false)]
+    pub allow_private_node_addresses: bool,
+
     /// Seconds without a caught-up chain poll before `/healthz/sync` returns 503
     #[arg(long, env = "HEALTH_MAX_SYNC_AGE_SECS", default_value = "300")]
     pub health_max_sync_age_secs: u64,
@@ -137,6 +141,7 @@ mod tests {
             uptime_check_interval: 60,
             geoip_db_path: "./assets/GeoLite2-City.mmdb".to_string(),
             health_max_sync_age_secs: 300,
+            allow_private_node_addresses: false,
         }
     }
 

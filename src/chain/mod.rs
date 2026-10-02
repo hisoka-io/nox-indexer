@@ -605,12 +605,28 @@ pub fn parse_multiaddr(url: &str) -> Option<(String, u16)> {
     ip.zip(port)
 }
 
+/// Admin API base URL of a node: its P2P IP and TCP port + 1. Empty when the
+/// multiaddr has no usable IP, or the IP may not be polled (see
+/// [`crate::node::targets`]).
 pub fn derive_admin_url(multiaddr: &str) -> String {
-    if let Some((ip, tcp_port)) = parse_multiaddr(multiaddr) {
-        format!("http://{ip}:{}", tcp_port + 1)
-    } else {
-        String::new()
+    derive_admin_url_with(multiaddr, crate::node::targets::private_targets_allowed())
+}
+
+pub fn derive_admin_url_with(multiaddr: &str, allow_private: bool) -> String {
+    let Some((ip_text, tcp_port)) = parse_multiaddr(multiaddr) else {
+        return String::new();
+    };
+    let Ok(ip) = ip_text.parse::<std::net::IpAddr>() else {
+        return String::new();
+    };
+    let Some(admin_port) = tcp_port.checked_add(1) else {
+        return String::new();
+    };
+    if !crate::node::targets::ip_allowed_with(ip, allow_private) {
+        return String::new();
     }
+    // SocketAddr adds the brackets an IPv6 host needs in a URL.
+    format!("http://{}", std::net::SocketAddr::new(ip, admin_port))
 }
 
 #[cfg(test)]
@@ -697,6 +713,35 @@ mod tests {
             "a lagging endpoint must not shrink the chunk size"
         );
         assert!(chain.check_logs_endpoint_head(100, 100).await.is_ok());
+    }
+
+    #[test]
+    fn admin_urls_are_derived_only_for_pollable_addresses() {
+        assert_eq!(
+            derive_admin_url_with("/ip4/3.226.251.110/tcp/15000/p2p/12D3KooW", false),
+            "http://3.226.251.110:15001"
+        );
+        assert_eq!(
+            derive_admin_url_with("/ip6/2600:1f18::1/tcp/15000", false),
+            "http://[2600:1f18::1]:15001"
+        );
+        for private in [
+            "/ip4/10.0.0.5/tcp/15000",
+            "/ip4/169.254.169.254/tcp/79",
+            "/ip6/fd00::1/tcp/15000",
+            "/ip4/127.0.0.1/tcp/9000",
+        ] {
+            assert_eq!(derive_admin_url_with(private, false), "", "{private}");
+        }
+        assert_eq!(
+            derive_admin_url_with("/ip4/127.0.0.1/tcp/9000", true),
+            "http://127.0.0.1:9001"
+        );
+        assert_eq!(derive_admin_url_with("/ip4/not-an-ip/tcp/9000", true), "");
+        assert_eq!(
+            derive_admin_url_with("/ip4/3.226.251.110/tcp/65535", false),
+            ""
+        );
     }
 
     #[test]
