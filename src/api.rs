@@ -182,6 +182,12 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
     // Nodes whose counters feed the totals (every node ever scraped). This is
     // not the registered node count; that is `nodes.length`.
     network_totals_json.insert("scrapedNodeCount".to_string(), json!(totals_nodes));
+    // Node versions before cumulativeMaximumCostUsd existed banked 0 for it, so
+    // the total is only a lower bound and can fall below cumulativeCostUsd.
+    network_totals_json.insert(
+        "cumulativeMaximumCostUsdIsLowerBound".to_string(),
+        json!(true),
+    );
 
     let indexer = state.sync.read().clone();
     let genesis = *state.network_genesis_ms.read();

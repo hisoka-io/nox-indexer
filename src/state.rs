@@ -306,6 +306,9 @@ pub fn public_error_summary(error: &str) -> &'static str {
     {
         return "database error";
     }
+    if lower.contains("unknown layout") {
+        return "registry layout not supported by this indexer version";
+    }
     if lower.contains("shutting down") {
         return "shutting down";
     }
@@ -427,6 +430,13 @@ mod tests {
         assert_eq!(
             public_error_summary("RPC reports chain id 1 but EXPECTED_CHAIN_ID is 421614"),
             "rpc chain id differs from EXPECTED_CHAIN_ID"
+        );
+        assert_eq!(
+            public_error_summary(
+                "relayer profile failed after 5 attempts: relayers(0xabc): relayers() returned \
+                 an unknown layout (first string offset 0x140)"
+            ),
+            "registry layout not supported by this indexer version"
         );
         let none = serde_json::to_value(SyncStatus::default()).unwrap();
         assert!(none["last_error"].is_null());
