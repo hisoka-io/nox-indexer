@@ -2,11 +2,11 @@ use axum::http::StatusCode;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
     response::IntoResponse,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
@@ -61,10 +61,11 @@ struct SeedTopologySnapshot {
 /// the platform healthcheck. Chain progress is reported in the body.
 pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse {
     let chain = state.sync.read().clone();
+    let sync_age_secs = chain.sync_age_secs(chrono::Utc::now().timestamp_millis());
     match state.db.ping().await {
         Ok(()) => (
             axum::http::StatusCode::OK,
-            axum::Json(json!({ "status": "ok", "chain": chain })),
+            axum::Json(json!({ "status": "ok", "sync_age_secs": sync_age_secs, "chain": chain })),
         )
             .into_response(),
         Err(e) => {
@@ -72,13 +73,53 @@ pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse 
             tracing::warn!("Healthcheck database ping failed: {e}");
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(
-                    json!({ "status": "degraded", "error": "database unavailable", "chain": chain }),
-                ),
+                axum::Json(json!({
+                    "status": "degraded",
+                    "error": "database unavailable",
+                    "sync_age_secs": sync_age_secs,
+                    "chain": chain,
+                })),
             )
                 .into_response()
         }
     }
+}
+
+/// For uptime monitors: 200 only when Postgres answers and the chain sync is
+/// live, verified and caught up within `HEALTH_MAX_SYNC_AGE_SECS`. Not used as
+/// the platform healthcheck, because a long replay after a deploy would fail it.
+pub async fn handle_healthz_sync(State(state): State<AppState>) -> impl IntoResponse {
+    let chain = state.sync.read().clone();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let sync_age_secs = chain.sync_age_secs(now_ms);
+    let max_sync_age_secs = state.max_sync_age_secs;
+
+    let problem = match state.db.ping().await {
+        Err(e) => {
+            tracing::warn!("Sync healthcheck database ping failed: {e}");
+            Some("database unavailable")
+        }
+        Ok(()) => chain
+            .check_health(now_ms, max_sync_age_secs)
+            .err()
+            .map(|reason| reason.as_str()),
+    };
+
+    let (code, status) = match problem {
+        None => (StatusCode::OK, "ok"),
+        Some(_) => (StatusCode::SERVICE_UNAVAILABLE, "unhealthy"),
+    };
+    (
+        code,
+        axum::Json(json!({
+            "status": status,
+            "error": problem,
+            "sync_age_secs": sync_age_secs,
+            "max_sync_age_secs": max_sync_age_secs,
+            "chain": chain,
+        })),
+    )
+        .into_response()
 }
 
 pub async fn handle_get_reputation(State(state): State<AppState>) -> impl IntoResponse {
@@ -141,9 +182,16 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
     // Nodes whose counters feed the totals (every node ever scraped). This is
     // not the registered node count; that is `nodes.length`.
     network_totals_json.insert("scrapedNodeCount".to_string(), json!(totals_nodes));
+    // Node versions before cumulativeMaximumCostUsd existed banked 0 for it, so
+    // the total is only a lower bound and can fall below cumulativeCostUsd.
+    network_totals_json.insert(
+        "cumulativeMaximumCostUsdIsLowerBound".to_string(),
+        json!(true),
+    );
 
     let indexer = state.sync.read().clone();
     let genesis = *state.network_genesis_ms.read();
+    let settlements = state.settlements.read().clone();
 
     axum::Json(json!({
         "nodes": nodes,
@@ -154,7 +202,70 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
         "network_genesis_ms": genesis,
         "network_reputation_avg": reputation_avg,
         "indexer": indexer,
+        "settlements": settlements,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct SettlementQuery {
+    limit: Option<u32>,
+}
+
+const SETTLEMENT_LIMIT_DEFAULT: u32 = 50;
+const SETTLEMENT_LIMIT_MAX: u32 = 500;
+
+/// Settlement totals plus the most recent settlements and exit credit claims.
+pub async fn handle_get_settlements(
+    State(state): State<AppState>,
+    Query(query): Query<SettlementQuery>,
+) -> impl IntoResponse {
+    let status = state.settlements.read().clone();
+    let chain_id = state.sync.read().chain_id;
+    let limit = i64::from(
+        query
+            .limit
+            .unwrap_or(SETTLEMENT_LIMIT_DEFAULT)
+            .clamp(1, SETTLEMENT_LIMIT_MAX),
+    );
+
+    let mut recent = Vec::new();
+    let mut recent_claims = Vec::new();
+    if let (Some(chain_id), Some(entry_point)) = (chain_id, status.entry_point.as_deref()) {
+        let settlements = state
+            .db
+            .recent_paid_settlements(chain_id, entry_point, limit)
+            .await;
+        let claims = match status.reward_pool.as_deref() {
+            Some(pool) => {
+                state
+                    .db
+                    .recent_exit_credit_claims(chain_id, pool, limit)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        };
+        match (settlements, claims) {
+            (Ok(settlements), Ok(claims)) => {
+                recent = settlements;
+                recent_claims = claims;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::error!("Failed to query settlements: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({ "error": "Failed to query settlements" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut body = serde_json::to_value(&status).unwrap_or_else(|_| json!({}));
+    if let Some(object) = body.as_object_mut() {
+        object.insert("recent".to_string(), json!(recent));
+        object.insert("recent_claims".to_string(), json!(recent_claims));
+    }
+    axum::Json(body).into_response()
 }
 
 pub async fn handle_ws_upgrade(

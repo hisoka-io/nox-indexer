@@ -85,9 +85,60 @@ pub struct StructuredMetrics {
     pub egress_exited: f64,
 }
 
+/// Response header in which nodes report their build version. Their JSON
+/// metrics body has no version field.
+pub const NODE_VERSION_HEADER: &str = "x-nox-version";
+const MAX_BUILD_VERSION_LEN: usize = 128;
+
+fn clean_version(raw: &str) -> String {
+    raw.chars()
+        .filter(char::is_ascii_graphic)
+        .take(MAX_BUILD_VERSION_LEN)
+        .collect()
+}
+
+impl StructuredMetrics {
+    /// Set `build_version` from the body if it carries one, else from the
+    /// version header. Only printable ASCII is kept, and the length is capped.
+    pub fn fill_build_version(&mut self, header: Option<&str>) {
+        let from_body = clean_version(&self.build_version);
+        self.build_version = if from_body.is_empty() {
+            header.map(clean_version).unwrap_or_default()
+        } else {
+            from_body
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::StructuredMetrics;
+
+    #[test]
+    fn build_version_comes_from_the_header_when_the_body_has_none() {
+        let mut metrics = StructuredMetrics::default();
+        metrics.fill_build_version(Some("0.1.0+48aca982e0cc05a76836800239563674e1b16499"));
+        assert_eq!(
+            metrics.build_version,
+            "0.1.0+48aca982e0cc05a76836800239563674e1b16499"
+        );
+
+        let mut metrics = StructuredMetrics {
+            build_version: "0.4.0".to_string(),
+            ..StructuredMetrics::default()
+        };
+        metrics.fill_build_version(Some("0.1.0"));
+        assert_eq!(metrics.build_version, "0.4.0");
+
+        let mut metrics = StructuredMetrics::default();
+        metrics.fill_build_version(None);
+        assert_eq!(metrics.build_version, "");
+
+        let mut metrics = StructuredMetrics::default();
+        metrics.fill_build_version(Some(&format!("<b>v1</b>\n{}", "x".repeat(500))));
+        assert!(metrics.build_version.starts_with("<b>v1</b>x"));
+        assert_eq!(metrics.build_version.len(), 128);
+    }
 
     #[test]
     fn paid_economics_schema_matches_node_exporter() {

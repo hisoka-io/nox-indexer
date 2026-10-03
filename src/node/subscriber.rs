@@ -8,8 +8,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::broadcast::{broadcast_cluster_snapshot, broadcast_event, broadcast_metrics};
 use crate::node::events::IngestEvent;
-use crate::node::metrics::StructuredMetrics;
+use crate::node::metrics::{StructuredMetrics, NODE_VERSION_HEADER};
 use crate::node::offsets::NodeOffset;
+use crate::node::targets::{node_http_client, url_allowed};
 use crate::state::{AppState, NodeStatus, MAX_RECENT_EVENTS};
 
 const UPTIME_CONCURRENCY: usize = 20;
@@ -90,6 +91,7 @@ async fn subscribe_node_events(
     cancel: CancellationToken,
 ) {
     let url = format!("{base_url}/events");
+    let client = node_http_client(None);
 
     loop {
         if cancel.is_cancelled() {
@@ -97,7 +99,13 @@ async fn subscribe_node_events(
         }
 
         tracing::info!("SSE connecting to {node_address} at {url}");
-        let mut es = EventSource::get(&url);
+        let mut es = match EventSource::new(client.get(&url)) {
+            Ok(es) => es,
+            Err(error) => {
+                tracing::warn!("SSE request for {node_address} could not be built: {error}");
+                return;
+            }
+        };
 
         loop {
             tokio::select! {
@@ -149,10 +157,7 @@ async fn scrape_node_metrics(
     base_url: String,
     cancel: CancellationToken,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    let client = node_http_client(Some(Duration::from_secs(5)));
     let metrics_url = format!("{base_url}/metrics/json");
     let mut interval = tokio::time::interval(Duration::from_secs(5));
 
@@ -165,6 +170,11 @@ async fn scrape_node_metrics(
             _ = interval.tick() => {
                 match client.get(&metrics_url).send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        let header_version = resp
+                            .headers()
+                            .get(NODE_VERSION_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
                         match resp.json::<StructuredMetrics>().await {
                             // The scraper can outlive a removal by one tick;
                             // only current members feed the totals.
@@ -174,6 +184,7 @@ async fn scrape_node_metrics(
                                 );
                             }
                             Ok(mut parsed) => {
+                                parsed.fill_build_version(header_version.as_deref());
                                 apply_lifetime_offsets(&state, &node_address, &mut parsed).await;
                                 state.metrics.write().insert(node_address.clone(), parsed.clone());
                                 broadcast_metrics(&state, &node_address, &parsed);
@@ -308,19 +319,52 @@ async fn flush_dirty_offsets(state: &AppState) {
 }
 
 struct ActiveNodeSub {
+    /// The admin URL the tasks were spawned with. A different current URL
+    /// (after `updateUrl`) restarts them.
+    base_url: String,
     sse_handle: JoinHandle<()>,
     metrics_handle: JoinHandle<()>,
     cancel: CancellationToken,
 }
 
-fn resolve_base_url(admin_url: &str, admin_port: u16) -> Option<String> {
-    if !admin_url.is_empty() {
-        Some(admin_url.to_string())
-    } else if admin_port > 0 {
-        Some(format!("http://127.0.0.1:{admin_port}"))
-    } else {
-        None
+impl ActiveNodeSub {
+    fn stop(self) {
+        self.cancel.cancel();
+        self.sse_handle.abort();
+        self.metrics_handle.abort();
     }
+}
+
+/// Addresses whose subscription must stop (removed, or URL changed) and
+/// addresses that need a new subscription (new, or URL changed).
+fn plan_subscription_changes(
+    active: &HashMap<String, String>,
+    current: &HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut stop: Vec<String> = active
+        .iter()
+        .filter(|(addr, url)| current.get(*addr) != Some(*url))
+        .map(|(addr, _)| addr.clone())
+        .collect();
+    let mut start: Vec<String> = current
+        .iter()
+        .filter(|(addr, url)| active.get(*addr) != Some(*url))
+        .map(|(addr, _)| addr.clone())
+        .collect();
+    stop.sort();
+    start.sort();
+    (stop, start)
+}
+
+fn resolve_base_url(admin_url: &str, admin_port: u16) -> Option<String> {
+    let url = if !admin_url.is_empty() {
+        admin_url.to_string()
+    } else if admin_port > 0 {
+        format!("http://127.0.0.1:{admin_port}")
+    } else {
+        return None;
+    };
+    url_allowed(&url).then_some(url)
 }
 
 pub async fn manage_subscriptions(state: AppState) {
@@ -333,7 +377,7 @@ pub async fn manage_subscriptions(state: AppState) {
                 tracing::info!("manage_subscriptions: shutting down, cancelling all node subscriptions");
                 for (addr, sub) in active.drain() {
                     tracing::debug!("Cancelling subscription for {addr}");
-                    sub.cancel.cancel();
+                    sub.stop();
                 }
                 return;
             }
@@ -349,10 +393,30 @@ pub async fn manage_subscriptions(state: AppState) {
             })
             .collect();
 
-        for (addr, base_url) in &current_nodes {
-            if active.contains_key(addr) {
-                continue;
+        let active_urls: HashMap<String, String> = active
+            .iter()
+            .map(|(addr, sub)| (addr.clone(), sub.base_url.clone()))
+            .collect();
+        let (stop, start) = plan_subscription_changes(&active_urls, &current_nodes);
+
+        for addr in &stop {
+            if let Some(sub) = active.remove(addr) {
+                match current_nodes.get(addr) {
+                    Some(url) => tracing::info!(
+                        "Node {addr} moved from {} to {url}; resubscribing",
+                        sub.base_url
+                    ),
+                    None => tracing::info!("Unsubscribing from removed node {addr}"),
+                }
+                sub.stop();
+                state.metrics.write().remove(addr);
             }
+        }
+
+        for addr in start {
+            let Some(base_url) = current_nodes.get(&addr) else {
+                continue;
+            };
 
             tracing::info!("Subscribing to node {addr} at {base_url}");
             let cancel = CancellationToken::new();
@@ -374,36 +438,18 @@ pub async fn manage_subscriptions(state: AppState) {
             active.insert(
                 addr.clone(),
                 ActiveNodeSub {
+                    base_url: base_url.clone(),
                     sse_handle,
                     metrics_handle,
                     cancel,
                 },
             );
         }
-
-        let removed: Vec<String> = active
-            .keys()
-            .filter(|addr| !current_nodes.contains_key(*addr))
-            .cloned()
-            .collect();
-
-        for addr in removed {
-            if let Some(sub) = active.remove(&addr) {
-                tracing::info!("Unsubscribing from removed node {addr}");
-                sub.cancel.cancel();
-                sub.sse_handle.abort();
-                sub.metrics_handle.abort();
-                state.metrics.write().remove(&addr);
-            }
-        }
     }
 }
 
 pub async fn uptime_check_loop(state: AppState, interval_secs: u64) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    let client = node_http_client(Some(Duration::from_secs(5)));
 
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
@@ -431,6 +477,11 @@ pub async fn uptime_check_loop(state: AppState, interval_secs: u64) {
             .map(|(address, admin_url)| {
                 let client = client.clone();
                 async move {
+                    // Rows written by older builds may hold an address that is
+                    // no longer polled: count it as unreachable.
+                    if !url_allowed(&admin_url) {
+                        return (address, false);
+                    }
                     let metrics_url = format!("{admin_url}/metrics/json");
                     let reachable = client
                         .get(&metrics_url)
@@ -683,5 +734,41 @@ mod tests {
 
         let totals = crate::node::offsets::network_totals(state.metric_offsets.read().values());
         assert_eq!(totals.packets_received, inflated.packets_received);
+    }
+}
+
+#[cfg(test)]
+mod subscription_plan_tests {
+    use super::*;
+
+    fn urls(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(addr, url)| (addr.to_string(), url.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_changed_node_url_restarts_its_subscription() {
+        let active = urls(&[
+            ("0xa", "http://1.1.1.1:15001"),
+            ("0xb", "http://2.2.2.2:15001"),
+            ("0xc", "http://3.3.3.3:15001"),
+        ]);
+        let current = urls(&[
+            ("0xa", "http://1.1.1.1:15001"),
+            ("0xb", "http://4.4.4.4:15001"),
+            ("0xd", "http://5.5.5.5:15001"),
+        ]);
+        let (stop, start) = plan_subscription_changes(&active, &current);
+        assert_eq!(stop, vec!["0xb", "0xc"]);
+        assert_eq!(start, vec!["0xb", "0xd"]);
+    }
+
+    #[test]
+    fn unchanged_subscriptions_are_left_alone() {
+        let same = urls(&[("0xa", "http://1.1.1.1:15001")]);
+        let (stop, start) = plan_subscription_changes(&same, &same);
+        assert!(stop.is_empty() && start.is_empty());
     }
 }

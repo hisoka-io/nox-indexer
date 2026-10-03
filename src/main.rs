@@ -21,12 +21,16 @@ use state::AppState;
 /// How often banked lifetime metric offsets are flushed to Postgres. Restart
 /// detection persists immediately; this bounds what an indexer crash can lose.
 const METRIC_OFFSET_FLUSH_SECS: u64 = 60;
+/// Backoff between database connection attempts at boot.
+const DB_CONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const DB_CONNECT_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("info,indexer=debug")
-        .init();
+    // RUST_LOG overrides the default, e.g. RUST_LOG=info,indexer=debug.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let args = Args::parse();
 
@@ -34,6 +38,9 @@ async fn main() {
         eprintln!("Config error: {e}");
         std::process::exit(1);
     });
+    node::targets::set_private_targets_allowed(
+        args.network == "localtestnet" || args.allow_private_node_addresses,
+    );
 
     let chain_config = Arc::new(
         chain::ChainConfig::new(
@@ -55,11 +62,29 @@ async fn main() {
         }),
     );
 
-    let state = init_state(&args, chain_config.clone()).await;
+    let settlement_config = chain::settlement::SettlementConfig::new(
+        args.entry_point_address.as_deref(),
+        args.reward_pool_address.as_deref(),
+        args.settlement_from_block.unwrap_or(net_config.from_block),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Settlement config error: {e}");
+        std::process::exit(1);
+    });
 
-    let handles = spawn_background_tasks(&state, &chain_config, args.uptime_check_interval);
+    let shutdown = CancellationToken::new();
+    install_shutdown_handler(shutdown.clone());
 
-    install_shutdown_handler(state.shutdown.clone());
+    let state = init_state(&args, chain_config.clone(), shutdown).await;
+
+    let mut handles = spawn_background_tasks(&state, &chain_config, args.uptime_check_interval);
+    if let Some(config) = settlement_config {
+        let s = state.clone();
+        let c = chain_config.clone();
+        handles.push(tokio::spawn(async move {
+            chain::settlement::run_settlement_sync(s, c, config).await
+        }));
+    }
 
     serve_http(state, args.port, &net_config, &args).await;
 
@@ -70,13 +95,47 @@ async fn main() {
     tracing::info!("Shutdown complete");
 }
 
-async fn init_state(args: &Args, chain: Arc<chain::ChainConfig>) -> AppState {
-    let db = db::Db::connect(&args.database_url)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to connect to database: {e}");
-            std::process::exit(1);
-        });
+/// Connect to Postgres, retrying with backoff instead of exiting. The platform
+/// restarts a crashed container only a few times, so a short database outage
+/// at boot must not use those restarts up and leave the indexer down.
+async fn connect_db(url: &str, shutdown: &CancellationToken) -> db::Db {
+    let mut attempt = 0_u32;
+    loop {
+        match db::Db::connect(url).await {
+            Ok(db) => {
+                if attempt > 0 {
+                    tracing::info!("Connected to database after {attempt} failed attempts");
+                }
+                return db;
+            }
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                let delay = chain::retry::jittered_backoff(
+                    attempt,
+                    DB_CONNECT_BACKOFF_BASE,
+                    DB_CONNECT_BACKOFF_CAP,
+                );
+                tracing::error!(
+                    "Database connection attempt {attempt} failed, retrying in {delay:?}: {e}"
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => {
+                        tracing::info!("Shutdown requested before the database was reachable");
+                        std::process::exit(0);
+                    }
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn init_state(
+    args: &Args,
+    chain: Arc<chain::ChainConfig>,
+    shutdown: CancellationToken,
+) -> AppState {
+    let db = connect_db(&args.database_url, &shutdown).await;
 
     let geo = match geo::GeoIp::open(&args.geoip_db_path) {
         Ok(g) => {
@@ -142,7 +201,7 @@ async fn init_state(args: &Args, chain: Arc<chain::ChainConfig>) -> AppState {
         tx,
         db,
         geo,
-        shutdown: CancellationToken::new(),
+        shutdown,
         metric_offsets: Arc::new(RwLock::new(metric_offsets)),
         sync: Arc::new(RwLock::new(state::SyncStatus {
             registry_address,
@@ -152,6 +211,8 @@ async fn init_state(args: &Args, chain: Arc<chain::ChainConfig>) -> AppState {
         seed_cache: Arc::new(tokio::sync::Mutex::new(None)),
         probe_now: Arc::new(tokio::sync::Notify::new()),
         network_genesis_ms: Arc::new(RwLock::new(network_genesis_ms)),
+        max_sync_age_secs: args.health_max_sync_age_secs,
+        settlements: Arc::new(RwLock::new(Default::default())),
     }
 }
 
@@ -242,6 +303,14 @@ async fn serve_http(state: AppState, port: u16, net_config: &NetworkConfig, args
             axum::routing::get(api::handle_seed_topology),
         )
         .route("/healthz", axum::routing::get(api::handle_healthz))
+        .route(
+            "/healthz/sync",
+            axum::routing::get(api::handle_healthz_sync),
+        )
+        .route(
+            "/v1/settlements",
+            axum::routing::get(api::handle_get_settlements),
+        )
         .layer(cors)
         .with_state(state.clone());
 

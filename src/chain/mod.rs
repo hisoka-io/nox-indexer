@@ -2,6 +2,7 @@ mod discovery;
 pub mod profile;
 pub mod retry;
 pub mod rpc;
+pub mod settlement;
 
 pub use discovery::run_chain_sync;
 
@@ -263,15 +264,27 @@ impl ChainConfig {
         to: u64,
         shutdown: &CancellationToken,
     ) -> Result<(Vec<Log>, u64), String> {
+        let base = Filter::new().address(self.registry_address);
+        self.fetch_filtered_logs_chunk(&base, from, to, shutdown)
+            .await
+    }
+
+    /// [`Self::fetch_logs_chunk`] for any address/topic filter; `base`'s block
+    /// range is replaced. Shares the adaptive chunk size, which tracks the
+    /// provider's limits rather than the contract.
+    pub async fn fetch_filtered_logs_chunk(
+        &self,
+        base: &Filter,
+        from: u64,
+        to: u64,
+        shutdown: &CancellationToken,
+    ) -> Result<(Vec<Log>, u64), String> {
         let mut attempt = 0_u32;
         loop {
             let span = self.chunk.lock().size();
             let end = from.saturating_add(span.saturating_sub(1)).min(to);
             let requested = end - from + 1;
-            let filter = Filter::new()
-                .address(self.registry_address)
-                .from_block(from)
-                .to_block(end);
+            let filter = base.clone().from_block(from).to_block(end);
 
             let error = match self.provider.get_logs(&filter).await {
                 Ok(logs) => match self.check_logs_endpoint_head(end, to).await {
@@ -549,6 +562,17 @@ impl ChainConfig {
         Ok((nodes, ethers::utils::hex::encode(fingerprint)))
     }
 
+    /// Timestamp (Unix seconds) of block `block`.
+    pub async fn block_timestamp(&self, block: u64) -> Result<u64, String> {
+        let header = self
+            .provider
+            .get_block(block)
+            .await
+            .map_err(|e| format!("eth_getBlockByNumber {block}: {e}"))?
+            .ok_or_else(|| format!("block {block} is not available yet"))?;
+        Ok(header.timestamp.low_u64())
+    }
+
     pub async fn current_block(&self) -> Result<u64, String> {
         self.provider
             .get_block_number()
@@ -605,12 +629,28 @@ pub fn parse_multiaddr(url: &str) -> Option<(String, u16)> {
     ip.zip(port)
 }
 
+/// Admin API base URL of a node: its P2P IP and TCP port + 1. Empty when the
+/// multiaddr has no usable IP, or the IP may not be polled (see
+/// [`crate::node::targets`]).
 pub fn derive_admin_url(multiaddr: &str) -> String {
-    if let Some((ip, tcp_port)) = parse_multiaddr(multiaddr) {
-        format!("http://{ip}:{}", tcp_port + 1)
-    } else {
-        String::new()
+    derive_admin_url_with(multiaddr, crate::node::targets::private_targets_allowed())
+}
+
+pub fn derive_admin_url_with(multiaddr: &str, allow_private: bool) -> String {
+    let Some((ip_text, tcp_port)) = parse_multiaddr(multiaddr) else {
+        return String::new();
+    };
+    let Ok(ip) = ip_text.parse::<std::net::IpAddr>() else {
+        return String::new();
+    };
+    let Some(admin_port) = tcp_port.checked_add(1) else {
+        return String::new();
+    };
+    if !crate::node::targets::ip_allowed_with(ip, allow_private) {
+        return String::new();
     }
+    // SocketAddr adds the brackets an IPv6 host needs in a URL.
+    format!("http://{}", std::net::SocketAddr::new(ip, admin_port))
 }
 
 #[cfg(test)]
@@ -627,9 +667,32 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
-                let mut buf = vec![0_u8; 8192];
-                let read = socket.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..read]);
+                // Read the whole request: under load a single read can return
+                // only the headers, and the method name is in the body.
+                let mut buf = Vec::new();
+                let mut chunk = vec![0_u8; 8192];
+                loop {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
                 let result = if request.contains("eth_blockNumber") {
                     format!("\"{head:#x}\"")
                 } else {
@@ -697,6 +760,35 @@ mod tests {
             "a lagging endpoint must not shrink the chunk size"
         );
         assert!(chain.check_logs_endpoint_head(100, 100).await.is_ok());
+    }
+
+    #[test]
+    fn admin_urls_are_derived_only_for_pollable_addresses() {
+        assert_eq!(
+            derive_admin_url_with("/ip4/3.226.251.110/tcp/15000/p2p/12D3KooW", false),
+            "http://3.226.251.110:15001"
+        );
+        assert_eq!(
+            derive_admin_url_with("/ip6/2600:1f18::1/tcp/15000", false),
+            "http://[2600:1f18::1]:15001"
+        );
+        for private in [
+            "/ip4/10.0.0.5/tcp/15000",
+            "/ip4/169.254.169.254/tcp/79",
+            "/ip6/fd00::1/tcp/15000",
+            "/ip4/127.0.0.1/tcp/9000",
+        ] {
+            assert_eq!(derive_admin_url_with(private, false), "", "{private}");
+        }
+        assert_eq!(
+            derive_admin_url_with("/ip4/127.0.0.1/tcp/9000", true),
+            "http://127.0.0.1:9001"
+        );
+        assert_eq!(derive_admin_url_with("/ip4/not-an-ip/tcp/9000", true), "");
+        assert_eq!(
+            derive_admin_url_with("/ip4/3.226.251.110/tcp/65535", false),
+            ""
+        );
     }
 
     #[test]
