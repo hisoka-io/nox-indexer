@@ -6,8 +6,6 @@ use reqwest_eventsource::{Event, EventSource};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use serde::Deserialize;
-
 use crate::broadcast::{broadcast_cluster_snapshot, broadcast_event, broadcast_metrics};
 use crate::node::events::IngestEvent;
 use crate::node::metrics::{StructuredMetrics, NODE_VERSION_HEADER};
@@ -17,81 +15,43 @@ use crate::state::{AppState, NodeStatus, MAX_RECENT_EVENTS};
 
 const UPTIME_CONCURRENCY: usize = 20;
 
-#[derive(Deserialize)]
-struct TopoNode {
-    address: String,
-    #[serde(default)]
-    layer: u8,
-    #[serde(default = "default_role")]
-    role: u8,
+/// Whether a node event may be kept in `recent_events` and sent to `/v1/live`.
+///
+/// Per-packet events are node-internal telemetry and are not republished.
+/// Traffic volume stays visible through the metric counters.
+pub fn is_republishable(event: &IngestEvent) -> bool {
+    !matches!(event, IngestEvent::PacketProcessed { .. })
 }
 
-fn default_role() -> u8 {
-    1
-}
-
-#[derive(Deserialize)]
-struct TopoSnapshot {
-    nodes: Vec<TopoNode>,
-}
-
-async fn sync_topology_from_node(state: &AppState, base_url: &str) {
-    let client = node_http_client(Some(Duration::from_secs(5)));
-
-    let url = format!("{base_url}/topology");
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.json::<TopoSnapshot>().await {
-            Ok(snapshot) => {
-                let updated_nodes = {
-                    let mut nodes = state.nodes.write();
-                    let mut changed = Vec::new();
-                    for topo_node in &snapshot.nodes {
-                        if let Some(ns) = nodes.get_mut(&topo_node.address) {
-                            if ns.layer != topo_node.layer || ns.role != topo_node.role {
-                                tracing::info!(
-                                    "Topology: {} layer {} -> {}, role {} -> {}",
-                                    ns.address,
-                                    ns.layer,
-                                    topo_node.layer,
-                                    ns.role,
-                                    topo_node.role
-                                );
-                                ns.layer = topo_node.layer;
-                                ns.role = topo_node.role;
-                                changed.push(ns.clone());
-                            }
-                        }
-                    }
-                    changed
-                };
-
-                if !updated_nodes.is_empty() {
-                    for node in &updated_nodes {
-                        if let Err(e) = state.db.upsert_node(node).await {
-                            tracing::warn!("Failed to persist node {}: {e}", node.address);
-                        }
-                    }
-                    broadcast_cluster_snapshot(state);
-                }
-                tracing::info!(
-                    "Topology sync: {} nodes from {base_url}",
-                    snapshot.nodes.len()
-                );
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse topology from {base_url}: {e}");
-            }
-        },
-        Ok(resp) => {
-            tracing::debug!("Topology fetch from {base_url} returned {}", resp.status());
+/// Check a membership change reported by a node against the registry state
+/// synced from chain. Returns the role to publish for an addition, `Some(None)`
+/// for a removal, or `None` when the address is not a known member (an addition
+/// must also still be registered).
+fn chain_view_of_topology_event(state: &AppState, event: &IngestEvent) -> Option<Option<u8>> {
+    let nodes = state.nodes.read();
+    match event {
+        IngestEvent::TopologyAdd { address, .. } => nodes
+            .get(&address.to_lowercase())
+            .filter(|node| node.status != NodeStatus::Deregistered)
+            .map(|node| Some(node.role)),
+        IngestEvent::TopologyRemove { address, .. } => {
+            nodes.get(&address.to_lowercase()).map(|_| None)
         }
-        Err(e) => {
-            tracing::debug!("Topology fetch from {base_url} failed: {e}");
-        }
+        _ => Some(None),
     }
 }
 
 pub fn process_event(state: &AppState, node_address: &str, event: &IngestEvent) {
+    if !is_republishable(event) {
+        return;
+    }
+
+    // Membership changes are published only for registry members, with the
+    // role as synced from chain.
+    let Some(chain_role) = chain_view_of_topology_event(state, event) else {
+        return;
+    };
+
     let dedup_key = match event {
         IngestEvent::TopologyAdd { address, .. } => Some(format!("topo_add:{address}")),
         IngestEvent::TopologyRemove { address, .. } => Some(format!("topo_remove:{address}")),
@@ -109,6 +69,9 @@ pub fn process_event(state: &AppState, node_address: &str, event: &IngestEvent) 
                 "node_address".into(),
                 serde_json::Value::String(node_address.to_string()),
             );
+            if let Some(role) = chain_role {
+                obj.insert("role".into(), serde_json::Value::from(role));
+            }
         }
         {
             let mut buffer = state.recent_events.write();
@@ -213,6 +176,13 @@ async fn scrape_node_metrics(
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned);
                         match resp.json::<StructuredMetrics>().await {
+                            // The scraper can outlive a removal by one tick;
+                            // only current members feed the totals.
+                            Ok(_) if !is_registered_member(&state, &node_address) => {
+                                tracing::debug!(
+                                    "Ignoring metrics from {node_address}: not a registered member"
+                                );
+                            }
                             Ok(mut parsed) => {
                                 parsed.fill_build_version(header_version.as_deref());
                                 apply_lifetime_offsets(&state, &node_address, &mut parsed).await;
@@ -248,20 +218,36 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn is_registered_member(state: &AppState, address: &str) -> bool {
+    state
+        .nodes
+        .read()
+        .get(address)
+        .is_some_and(|node| node.status != NodeStatus::Deregistered)
+}
+
 /// Fold banked lifetime totals into a freshly scraped reading.
 ///
 /// Detects a node restart, banks the previous incarnation's final counters, then
-/// adds the running total onto `parsed` so the dashboard sees a continuous
-/// lifetime figure. The write lock is released before any DB call.
+/// replaces the counters in `parsed` with the node's accepted lifetime totals so
+/// the dashboard sees a continuous figure. The write lock is released before
+/// any DB call.
 async fn apply_lifetime_offsets(state: &AppState, address: &str, parsed: &mut StructuredMetrics) {
     let banked_snapshot = {
         let mut map = state.metric_offsets.write();
         let offset = map.entry(address.to_string()).or_default();
         // Observe the raw reading first; applying before observing would fold
         // previously banked totals back into last_raw and double-count them.
-        let restarted = offset.observe(parsed);
+        let seen = offset.observe(parsed, std::time::Instant::now());
         offset.apply(parsed);
-        if restarted {
+        if seen.adjusted && !offset.adjusting {
+            tracing::warn!(
+                "Node {address} reported counters that went backwards or grew faster \
+                 than the accepted rate; holding or capping them"
+            );
+        }
+        offset.adjusting = seen.adjusted;
+        if seen.restarted {
             Some(offset.clone())
         } else {
             None
@@ -427,8 +413,6 @@ pub async fn manage_subscriptions(state: AppState) {
             }
         }
 
-        let mut new_node_url: Option<String> = None;
-
         for addr in start {
             let Some(base_url) = current_nodes.get(&addr) else {
                 continue;
@@ -460,14 +444,6 @@ pub async fn manage_subscriptions(state: AppState) {
                     cancel,
                 },
             );
-
-            if new_node_url.is_none() {
-                new_node_url = Some(base_url.clone());
-            }
-        }
-
-        if let Some(url) = new_node_url {
-            sync_topology_from_node(&state, &url).await;
         }
     }
 }
@@ -596,36 +572,173 @@ async fn apply_status_change(state: &AppState, address: &str, reachable: bool) -
     false
 }
 
-pub async fn periodic_topology_sync(state: AppState) {
-    let mut interval = tokio::time::interval(Duration::from_secs(300));
-    interval.tick().await; // skip the immediate first tick
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::NodeState;
+    use tokio::sync::broadcast::error::TryRecvError;
 
-    loop {
-        tokio::select! {
-            _ = state.shutdown.cancelled() => {
-                tracing::info!("periodic_topology_sync: shutting down");
-                return;
-            }
-            _ = interval.tick() => {}
+    const NODE: &str = "0x1111111111111111111111111111111111111111";
+
+    fn member(address: &str, status: NodeStatus) -> NodeState {
+        let mut node = NodeState::from_chain_info(
+            &crate::chain::OnChainNode {
+                address: address.to_string(),
+                url: "/ip4/127.0.0.1/tcp/9000".to_string(),
+                ingress_url: String::new(),
+                metadata_url: String::new(),
+                sphinx_key: "11".repeat(32),
+                role: 1,
+                frozen: false,
+            },
+            421_614,
+            "0xabc",
+        );
+        node.status = status;
+        node
+    }
+
+    #[tokio::test]
+    async fn per_packet_events_are_neither_stored_nor_republished() {
+        let state = AppState::for_tests();
+        let mut live = state.tx.subscribe();
+
+        process_event(
+            &state,
+            NODE,
+            &IngestEvent::PacketProcessed {
+                duration_ms: 42,
+                node_id: "nox-11111111".to_string(),
+            },
+        );
+        assert!(state.recent_events.read().is_empty());
+        assert!(matches!(live.try_recv(), Err(TryRecvError::Empty)));
+
+        process_event(
+            &state,
+            NODE,
+            &IngestEvent::PeerConnected {
+                peer_id: "peer".to_string(),
+                node_id: "nox-11111111".to_string(),
+            },
+        );
+        let recent = state.recent_events.read().clone();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["kind"], "peer_connected");
+        assert_eq!(recent[0]["node_address"], NODE);
+        let message: serde_json::Value =
+            serde_json::from_str(&live.try_recv().expect("event is published")).unwrap();
+        assert_eq!(message["type"], "EVENT");
+        assert_eq!(message["payload"]["kind"], "peer_connected");
+    }
+
+    #[tokio::test]
+    async fn membership_events_are_published_only_for_registry_members() {
+        let state = AppState::for_tests();
+        let departed = "0x2222222222222222222222222222222222222222";
+        let unknown = "0x3333333333333333333333333333333333333333";
+        {
+            let mut nodes = state.nodes.write();
+            nodes.insert(NODE.to_string(), member(NODE, NodeStatus::Online));
+            nodes.insert(
+                departed.to_string(),
+                member(departed, NodeStatus::Deregistered),
+            );
         }
-
-        let maybe_url = {
-            let nodes = state.nodes.read();
-            nodes
-                .values()
-                .find(|n| n.status == NodeStatus::Online && url_allowed(&n.admin_url))
-                .map(|n| n.admin_url.clone())
+        let add = |address: &str, role: u8| IngestEvent::TopologyAdd {
+            address: address.to_string(),
+            role,
+            stake: "0".to_string(),
+            node_id: "nox-reporter".to_string(),
+        };
+        let remove = |address: &str| IngestEvent::TopologyRemove {
+            address: address.to_string(),
+            node_id: "nox-reporter".to_string(),
         };
 
-        if let Some(url) = maybe_url {
-            tracing::debug!("Periodic topology sync from {url}");
-            sync_topology_from_node(&state, &url).await;
+        process_event(&state, NODE, &add(unknown, 2));
+        process_event(&state, NODE, &add(departed, 2));
+        process_event(&state, NODE, &remove(unknown));
+        assert!(state.recent_events.read().is_empty());
+
+        // A member's addition carries the registry role, whatever was reported.
+        process_event(
+            &state,
+            NODE,
+            &add(&NODE.to_uppercase().replace("0X", "0x"), 2),
+        );
+        process_event(&state, NODE, &remove(departed));
+        let recent = state.recent_events.read().clone();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["kind"], "topology_add");
+        assert_eq!(recent[0]["role"], 1);
+        assert_eq!(recent[1]["kind"], "topology_remove");
+        assert_eq!(recent[1]["address"], departed);
+    }
+
+    #[test]
+    fn per_packet_events_still_parse() {
+        // Nodes keep sending them; they must be dropped quietly, not logged as
+        // parse errors on every packet.
+        let event: IngestEvent = serde_json::from_str(
+            r#"{"kind":"packet_processed","duration_ms":12,"node_id":"nox-1"}"#,
+        )
+        .unwrap();
+        assert!(!is_republishable(&event));
+    }
+
+    #[tokio::test]
+    async fn only_registered_members_feed_metrics() {
+        let state = AppState::for_tests();
+        let departed = "0x2222222222222222222222222222222222222222";
+        {
+            let mut nodes = state.nodes.write();
+            nodes.insert(NODE.to_string(), member(NODE, NodeStatus::Offline));
+            nodes.insert(
+                departed.to_string(),
+                member(departed, NodeStatus::Deregistered),
+            );
         }
+
+        assert!(is_registered_member(&state, NODE));
+        assert!(!is_registered_member(&state, departed));
+        assert!(!is_registered_member(
+            &state,
+            "0x3333333333333333333333333333333333333333"
+        ));
+    }
+
+    #[tokio::test]
+    async fn scraped_counters_are_bounded_before_they_reach_the_totals() {
+        let state = AppState::for_tests();
+        let mut first = StructuredMetrics {
+            node_start_time: 1_000.0,
+            packets_received: 10.0,
+            ..Default::default()
+        };
+        apply_lifetime_offsets(&state, NODE, &mut first).await;
+        assert_eq!(first.packets_received, 10.0);
+
+        let mut inflated = StructuredMetrics {
+            node_start_time: 1_000.0,
+            packets_received: 1.0e15,
+            ..Default::default()
+        };
+        apply_lifetime_offsets(&state, NODE, &mut inflated).await;
+        assert!(
+            inflated.packets_received < 1.0e5,
+            "{}",
+            inflated.packets_received
+        );
+        assert!(state.metric_offsets.read()[NODE].adjusting);
+
+        let totals = crate::node::offsets::network_totals(state.metric_offsets.read().values());
+        assert_eq!(totals.packets_received, inflated.packets_received);
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod subscription_plan_tests {
     use super::*;
 
     fn urls(entries: &[(&str, &str)]) -> HashMap<String, String> {

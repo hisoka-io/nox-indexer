@@ -107,7 +107,8 @@ WS   /v1/live         pushes CLUSTER / METRICS / EVENT messages
 
 | Field | Meaning |
 |-------|---------|
-| `network_totals` | Lifetime counters (`packetsReceived`, `packetsForwarded`, ...) summed over every node ever scraped, registered or not, plus `scrapedNodeCount` (how many nodes feed the totals; not the registered count, which is `nodes.length`) |
+| `network_totals` | Lifetime counters (`packetsReceived`, `packetsForwarded`, ...) summed over every node ever scraped, registered or not, plus `scrapedNodeCount` (how many nodes feed the totals; not the registered count, which is `nodes.length`). New readings are taken only from registered members, and each counter is accepted only if it moves forward and its growth fits an allowance that refills at a per-counter rate ceiling (see `src/node/offsets.rs`). The ceilings reject absurd values; they do not verify that reported traffic was real |
+| `recent_events` | The last 200 node lifecycle and topology events (`node_started`, `peer_connected`, `topology_add`, ...). Per-packet events are not republished. `topology_add` and `topology_remove` are published only for addresses known from the registry, and `topology_add` carries the registry role |
 | `network_genesis_ms` | Earliest uptime-check evidence (Unix ms), estimated once as `last_check_ms - total_checks * interval` |
 | `network_reputation_avg` | Mean reputation of registered nodes only |
 | `network_totals.cumulativeMaximumCostUsdIsLowerBound` | Always `true`: node versions from before `cumulativeMaximumCostUsd` existed banked 0 for it, so the total can be below `cumulativeCostUsd`. Do not quote it as a maximum |
@@ -118,6 +119,9 @@ Node `buildVersion` comes from the metrics JSON when present, otherwise from the
 `x-nox-version` response header.
 
 Nodes carry `frozen`: a frozen node is still a registry member but must not be routed through.
+Each node's `role` comes from the registry and its `layer` is derived from that role (exits are
+always layer 2), the same way `/seed/topology` derives it. Nodes' own `/topology` is not read.
+Roles stored in Postgres are refreshed from chain on every boot sync.
 
 `/seed/topology` returns schema version 2. Its `nodes` array contains every registered member,
 with profiles read at the last processed block (a few seconds behind head), and its count and
