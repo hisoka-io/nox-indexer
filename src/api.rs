@@ -44,6 +44,27 @@ struct SeedLiveness {
     address: String,
     status: NodeStatus,
     observed_at_unix: u64,
+    /// What the node reports about itself in `/metrics/json`. Omitted when the
+    /// node has no report, and for every node while any online exit lacks one
+    /// (see `assemble_seed_topology`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<Vec<String>>,
+    /// Informational; omitted when the node has not reported a version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_version: Option<String>,
+}
+
+/// What the indexer last read from one node's own endpoints.
+#[derive(Default, Clone, Debug)]
+struct NodeReport {
+    capabilities: Option<Vec<String>>,
+    build_version: Option<String>,
+    pow_difficulty: Option<u32>,
+}
+
+/// The `role` values that can be chosen as exits (2 = exit, 3 = full).
+fn is_exit_role(role: u8) -> bool {
+    matches!(role, 2 | 3)
 }
 
 #[derive(Serialize)]
@@ -368,6 +389,29 @@ async fn build_seed_topology(state: &AppState) -> Result<SeedTopologySnapshot, S
         .map(|node| (node.address.to_lowercase(), node.status.clone()))
         .collect();
 
+    let mut reports: std::collections::HashMap<String, NodeReport> = state
+        .metrics
+        .read()
+        .iter()
+        .map(|(address, metrics)| {
+            (
+                address.to_lowercase(),
+                NodeReport {
+                    capabilities: metrics.capabilities.clone(),
+                    build_version: Some(metrics.build_version.clone())
+                        .filter(|version| !version.is_empty()),
+                    pow_difficulty: None,
+                },
+            )
+        })
+        .collect();
+    for (address, difficulty) in state.pow_difficulties.read().iter() {
+        reports
+            .entry(address.to_lowercase())
+            .or_default()
+            .pow_difficulty = Some(*difficulty);
+    }
+
     let now_unix = u64::try_from(chrono::Utc::now().timestamp())
         .map_err(|_| "system time is before Unix epoch".to_string())?;
     assemble_seed_topology(
@@ -375,6 +419,8 @@ async fn build_seed_topology(state: &AppState) -> Result<SeedTopologySnapshot, S
         pinned.fingerprint,
         &statuses,
         &observed_at,
+        &reports,
+        state.seed_max_pow_difficulty,
         pinned.block,
         now_unix,
     )
@@ -383,11 +429,24 @@ async fn build_seed_topology(state: &AppState) -> Result<SeedTopologySnapshot, S
 /// Build the wire snapshot. Membership comes only from the chain-pinned set;
 /// indexer state contributes liveness, and a member it has no status for (or
 /// one that is frozen) is reported offline.
+///
+/// Capabilities are all or nothing. SDK 0.3.0 and later switch to capability
+/// mode as soon as any node carries a `capabilities` list, and then pick only
+/// exits that list `paid_v2` for paid execution. So capabilities are published
+/// only while every online exit has its own well-formed report; otherwise they
+/// are omitted for every node and clients keep their earlier behaviour. Each
+/// list is the node's own report, never inferred from role or version.
+///
+/// `pow_difficulty` is the highest difficulty an online member reports, capped
+/// at `max_pow_difficulty`: a packet that meets it is accepted by every entry.
+#[allow(clippy::too_many_arguments)]
 fn assemble_seed_topology(
     members: Vec<crate::chain::PinnedTopologyNode>,
     fingerprint: String,
     statuses: &std::collections::BTreeMap<String, NodeStatus>,
     observed_at: &std::collections::HashMap<String, u64>,
+    reports: &std::collections::HashMap<String, NodeReport>,
+    max_pow_difficulty: u32,
     block_number: u64,
     now_unix: u64,
 ) -> Result<SeedTopologySnapshot, String> {
@@ -400,18 +459,43 @@ fn assemble_seed_topology(
     {
         return Err("pinned members are not in canonical address order".to_string());
     }
+    let is_online = |member: &crate::chain::PinnedTopologyNode| {
+        !member.frozen && matches!(statuses.get(&member.address), Some(NodeStatus::Online))
+    };
+    let report_of = |address: &str| reports.get(address);
+    let publish_capabilities = members
+        .iter()
+        .filter(|member| is_online(member) && is_exit_role(member.role))
+        .all(|member| report_of(&member.address).is_some_and(|r| r.capabilities.is_some()));
+    if !publish_capabilities {
+        tracing::debug!("Seed capabilities withheld: an online exit has no capability report");
+    }
+    let pow_difficulty = members
+        .iter()
+        .filter(|member| is_online(member))
+        .filter_map(|member| report_of(&member.address).and_then(|r| r.pow_difficulty))
+        .max()
+        .unwrap_or(0)
+        .min(max_pow_difficulty);
+
     let mut liveness = Vec::with_capacity(members.len());
     let mut nodes = Vec::with_capacity(members.len());
     for member in members {
-        let status = match statuses.get(&member.address) {
-            Some(NodeStatus::Online) if !member.frozen => NodeStatus::Online,
-            _ => NodeStatus::Offline,
+        let status = if is_online(&member) {
+            NodeStatus::Online
+        } else {
+            NodeStatus::Offline
         };
         let observation = observed_at.get(&member.address).copied().unwrap_or(0);
+        let report = report_of(&member.address);
         liveness.push(SeedLiveness {
             address: member.address.clone(),
             status,
             observed_at_unix: observation,
+            capabilities: report
+                .and_then(|r| r.capabilities.clone())
+                .filter(|_| publish_capabilities),
+            build_version: report.and_then(|r| r.build_version.clone()),
         });
         nodes.push(SeedTopologyNode {
             address: member.address,
@@ -433,7 +517,7 @@ fn assemble_seed_topology(
         fingerprint,
         timestamp: now_unix,
         block_number,
-        pow_difficulty: 0,
+        pow_difficulty,
         liveness,
     })
 }
@@ -495,6 +579,53 @@ mod tests {
         }
     }
 
+    fn no_reports() -> std::collections::HashMap<String, NodeReport> {
+        std::collections::HashMap::new()
+    }
+
+    fn exit(address: &str) -> PinnedTopologyNode {
+        PinnedTopologyNode {
+            role: 2,
+            layer: 2,
+            ..member(address)
+        }
+    }
+
+    fn report(capabilities: Option<&[&str]>, pow: Option<u32>) -> NodeReport {
+        NodeReport {
+            capabilities: capabilities
+                .map(|names| names.iter().map(|name| name.to_string()).collect()),
+            build_version: Some("0.4.0-rc.3".to_string()),
+            pow_difficulty: pow,
+        }
+    }
+
+    fn online(addresses: &[&str]) -> std::collections::BTreeMap<String, NodeStatus> {
+        addresses
+            .iter()
+            .map(|address| (address.to_string(), NodeStatus::Online))
+            .collect()
+    }
+
+    fn seed_json(
+        members: Vec<PinnedTopologyNode>,
+        statuses: &std::collections::BTreeMap<String, NodeStatus>,
+        reports: &std::collections::HashMap<String, NodeReport>,
+    ) -> serde_json::Value {
+        let snapshot = assemble_seed_topology(
+            members,
+            "00".repeat(32),
+            statuses,
+            &std::collections::HashMap::new(),
+            reports,
+            16,
+            7,
+            101,
+        )
+        .expect("ordered members must produce a seed snapshot");
+        serde_json::to_value(snapshot).expect("seed snapshot serializes")
+    }
+
     const ONLINE: &str = "0x1111111111111111111111111111111111111111";
     const OFFLINE: &str = "0x2222222222222222222222222222222222222222";
     const FROZEN: &str = "0x3333333333333333333333333333333333333333";
@@ -515,6 +646,8 @@ mod tests {
             "00".repeat(32),
             &statuses,
             &observed,
+            &no_reports(),
+            16,
             7,
             101,
         )
@@ -538,6 +671,8 @@ mod tests {
             "00".repeat(32),
             &statuses,
             &std::collections::HashMap::new(),
+            &no_reports(),
+            16,
             7,
             101,
         )
@@ -560,6 +695,8 @@ mod tests {
             "00".repeat(32),
             &std::collections::BTreeMap::new(),
             &std::collections::HashMap::new(),
+            &no_reports(),
+            16,
             7,
             101,
         )
@@ -574,9 +711,136 @@ mod tests {
             "00".repeat(32),
             &std::collections::BTreeMap::new(),
             &std::collections::HashMap::new(),
+            &no_reports(),
+            16,
             7,
             101,
         )
         .is_err());
+    }
+
+    const RELAY: &str = "0x4444444444444444444444444444444444444444";
+    const EXIT_A: &str = "0x5555555555555555555555555555555555555555";
+    const EXIT_B: &str = "0x6666666666666666666666666666666666666666";
+
+    #[test]
+    fn capabilities_and_versions_are_published_when_every_online_exit_reports() {
+        let reports = std::collections::HashMap::from([
+            (RELAY.to_string(), report(Some(&["surb_v2"]), Some(1))),
+            (
+                EXIT_A.to_string(),
+                report(Some(&["paid_v2", "surb_v2"]), Some(1)),
+            ),
+            (EXIT_B.to_string(), report(Some(&["surb_v2"]), Some(1))),
+        ]);
+        let json = seed_json(
+            vec![member(RELAY), exit(EXIT_A), exit(EXIT_B)],
+            &online(&[RELAY, EXIT_A, EXIT_B]),
+            &reports,
+        );
+
+        assert_eq!(
+            json["liveness"][0],
+            serde_json::json!({
+                "address": RELAY,
+                "status": "online",
+                "observed_at_unix": 0,
+                "capabilities": ["surb_v2"],
+                "build_version": "0.4.0-rc.3",
+            })
+        );
+        assert_eq!(
+            json["liveness"][1]["capabilities"],
+            serde_json::json!(["paid_v2", "surb_v2"])
+        );
+        // An exit without a chain executor reports no paid_v2, and none is added.
+        assert_eq!(
+            json["liveness"][2]["capabilities"],
+            serde_json::json!(["surb_v2"])
+        );
+        assert_eq!(json["pow_difficulty"], 1);
+    }
+
+    #[test]
+    fn capabilities_are_withheld_for_all_nodes_while_an_online_exit_lacks_a_report() {
+        for missing in [Some(report(None, Some(1))), None] {
+            let mut reports = std::collections::HashMap::from([
+                (RELAY.to_string(), report(Some(&["surb_v2"]), Some(1))),
+                (
+                    EXIT_A.to_string(),
+                    report(Some(&["paid_v2", "surb_v2"]), Some(1)),
+                ),
+            ]);
+            if let Some(legacy) = missing.clone() {
+                reports.insert(EXIT_B.to_string(), legacy);
+            }
+            let json = seed_json(
+                vec![member(RELAY), exit(EXIT_A), exit(EXIT_B)],
+                &online(&[RELAY, EXIT_A, EXIT_B]),
+                &reports,
+            );
+            for entry in json["liveness"].as_array().unwrap() {
+                assert!(entry.get("capabilities").is_none(), "{entry}");
+            }
+            assert_eq!(json["liveness"][0]["build_version"], "0.4.0-rc.3");
+            assert_eq!(json["liveness"][1]["build_version"], "0.4.0-rc.3");
+        }
+    }
+
+    #[test]
+    fn offline_or_frozen_exits_without_reports_do_not_block_capabilities() {
+        let reports = std::collections::HashMap::from([(
+            EXIT_A.to_string(),
+            report(Some(&["paid_v2", "surb_v2"]), Some(1)),
+        )]);
+        let mut frozen = exit(EXIT_B);
+        frozen.frozen = true;
+        let json = seed_json(
+            vec![member(RELAY), exit(EXIT_A), frozen],
+            &online(&[EXIT_A, EXIT_B]),
+            &reports,
+        );
+        assert_eq!(
+            json["liveness"][1]["capabilities"],
+            serde_json::json!(["paid_v2", "surb_v2"])
+        );
+        // A relay without a report is simply not v2-capable; it does not block.
+        assert!(json["liveness"][0].get("capabilities").is_none());
+        assert!(json["liveness"][0].get("build_version").is_none());
+        assert!(json["liveness"][2].get("capabilities").is_none());
+    }
+
+    #[test]
+    fn pow_difficulty_is_the_highest_online_report_capped() {
+        let reports = std::collections::HashMap::from([
+            (RELAY.to_string(), report(Some(&[]), Some(2))),
+            (EXIT_A.to_string(), report(Some(&["paid_v2"]), Some(5))),
+            (EXIT_B.to_string(), report(Some(&["paid_v2"]), Some(9))),
+        ]);
+        let json = seed_json(
+            vec![member(RELAY), exit(EXIT_A), exit(EXIT_B)],
+            &online(&[RELAY, EXIT_A]),
+            &reports,
+        );
+        assert_eq!(json["pow_difficulty"], 5, "offline nodes do not count");
+
+        let capped = assemble_seed_topology(
+            vec![member(RELAY), exit(EXIT_A)],
+            "00".repeat(32),
+            &online(&[RELAY, EXIT_A]),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::from([(EXIT_A.to_string(), report(None, Some(40)))]),
+            16,
+            7,
+            101,
+        )
+        .unwrap();
+        assert_eq!(capped.pow_difficulty, 16);
+
+        let json = seed_json(vec![member(RELAY)], &online(&[RELAY]), &no_reports());
+        assert_eq!(
+            json["pow_difficulty"], 0,
+            "no reports keeps the SDK default"
+        );
     }
 }

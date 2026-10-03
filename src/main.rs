@@ -194,6 +194,9 @@ async fn init_state(
         chain,
         nodes: Arc::new(RwLock::new(persisted_nodes)),
         metrics: Arc::new(RwLock::new(HashMap::new())),
+        pow_difficulties: Arc::new(RwLock::new(HashMap::new())),
+        node_topology_poll_secs: args.node_topology_poll_secs,
+        seed_max_pow_difficulty: args.seed_max_pow_difficulty,
         recent_events: Arc::new(RwLock::new(VecDeque::with_capacity(
             state::MAX_RECENT_EVENTS + 10,
         ))),

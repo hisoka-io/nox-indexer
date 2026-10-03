@@ -581,6 +581,7 @@ async fn remove_chain_node(state: &AppState, address: Address) {
     }
     state.nodes.write().remove(&addr_str);
     state.metrics.write().remove(&addr_str);
+    state.pow_difficulties.write().remove(&addr_str);
     broadcast_cluster_snapshot(state);
 }
 

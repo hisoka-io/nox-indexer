@@ -349,6 +349,12 @@ pub struct AppState {
     pub chain: Arc<ChainConfig>,
     pub nodes: Arc<RwLock<HashMap<String, NodeState>>>,
     pub metrics: Arc<RwLock<HashMap<String, StructuredMetrics>>>,
+    /// PoW difficulty each node's own `/topology` reports, by node address.
+    pub pow_difficulties: Arc<RwLock<HashMap<String, u32>>>,
+    /// Seconds between reads of a node's `/topology` for its PoW difficulty.
+    pub node_topology_poll_secs: u64,
+    /// Ceiling on the PoW difficulty published in `/seed/topology`.
+    pub seed_max_pow_difficulty: u32,
     pub recent_events: Arc<RwLock<VecDeque<Value>>>,
     pub topo_dedup: Arc<Mutex<TopoDedup>>,
     pub tx: broadcast::Sender<String>,
@@ -426,6 +432,9 @@ impl AppState {
             chain: Arc::new(chain),
             nodes: Arc::default(),
             metrics: Arc::default(),
+            pow_difficulties: Arc::default(),
+            node_topology_poll_secs: 60,
+            seed_max_pow_difficulty: 16,
             recent_events: Arc::default(),
             topo_dedup: Arc::new(Mutex::new(TopoDedup::new())),
             tx,
