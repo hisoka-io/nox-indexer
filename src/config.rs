@@ -86,6 +86,15 @@ pub struct Args {
     /// Seconds without a caught-up chain poll before `/healthz/sync` returns 503
     #[arg(long, env = "HEALTH_MAX_SYNC_AGE_SECS", default_value = "300")]
     pub health_max_sync_age_secs: u64,
+
+    /// Seconds between reads of each node's `/topology` for its PoW difficulty
+    #[arg(long, env = "NODE_TOPOLOGY_POLL_SECS", default_value = "60")]
+    pub node_topology_poll_secs: u64,
+
+    /// Ceiling on the `pow_difficulty` published in `/seed/topology`
+    /// (16 matches the most an SDK client adopts from a seed)
+    #[arg(long, env = "SEED_MAX_POW_DIFFICULTY", default_value = "16")]
+    pub seed_max_pow_difficulty: u32,
 }
 
 pub struct NetworkConfig {
@@ -120,6 +129,10 @@ impl NetworkConfig {
             .filter(|urls| !urls.is_empty())
             .or_else(|| default_rpc.map(|url| vec![url]))
             .ok_or_else(|| format!("--rpc-url is required for network '{}'", args.network))?;
+
+        if args.node_topology_poll_secs == 0 {
+            return Err("NODE_TOPOLOGY_POLL_SECS must be positive".to_string());
+        }
 
         if args.log_chunk_min == 0 || args.log_chunk_min > args.log_chunk_max {
             return Err("LOG_CHUNK_MIN must be positive and not above LOG_CHUNK_MAX".to_string());
@@ -158,6 +171,8 @@ mod tests {
             entry_point_address: None,
             reward_pool_address: None,
             settlement_from_block: None,
+            node_topology_poll_secs: 60,
+            seed_max_pow_difficulty: 16,
         }
     }
 
@@ -182,6 +197,16 @@ mod tests {
             vec!["https://a.example/rpc", "https://b.example/rpc"]
         );
         assert_eq!(config.confirmations, 20);
+    }
+
+    #[test]
+    fn zero_node_topology_poll_interval_is_rejected() {
+        let mut zero = args("localtestnet", None, 10);
+        zero.node_topology_poll_secs = 0;
+        assert!(matches!(
+            NetworkConfig::resolve(&zero),
+            Err(message) if message.contains("NODE_TOPOLOGY_POLL_SECS")
+        ));
     }
 
     #[test]

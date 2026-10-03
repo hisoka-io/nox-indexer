@@ -40,6 +40,8 @@ All options are configurable via env vars or CLI flags. See `.env.sample` for de
 | `REWARD_POOL_ADDRESS` | NoxRewardPool; adds exit credit claims and pool balances (needs `ENTRY_POINT_ADDRESS`) | No |
 | `SETTLEMENT_FROM_BLOCK` | First block scanned for settlements (default `FROM_BLOCK`) | No |
 | `HEALTH_MAX_SYNC_AGE_SECS` | Sync age above which `/healthz/sync` returns 503 (default 300) | No |
+| `NODE_TOPOLOGY_POLL_SECS` | Seconds between reads of each node's `/topology` for its PoW difficulty (default 60) | No |
+| `SEED_MAX_POW_DIFFICULTY` | Ceiling on the seed's `pow_difficulty` (default 16, the most SDK clients adopt) | No |
 | `ALLOW_PRIVATE_NODE_ADDRESSES` | Poll loopback/private node addresses outside localtestnet (default false) | No |
 | `RUST_LOG` | Log filter (default `info`) | No |
 
@@ -120,7 +122,8 @@ Node `buildVersion` comes from the metrics JSON when present, otherwise from the
 
 Nodes carry `frozen`: a frozen node is still a registry member but must not be routed through.
 Each node's `role` comes from the registry and its `layer` is derived from that role (exits are
-always layer 2), the same way `/seed/topology` derives it. Nodes' own `/topology` is not read.
+always layer 2), the same way `/seed/topology` derives it. A node's own `/topology` is read only
+for its `pow_difficulty`.
 Roles stored in Postgres are refreshed from chain on every boot sync.
 
 `/seed/topology` returns schema version 2. Its `nodes` array contains every registered member,
@@ -130,6 +133,32 @@ online/offline observation for the same member set; frozen members stay in `node
 fingerprint includes them) but are always `offline`. Snapshots are cached for 30s and rebuilt
 when membership changes; the endpoint returns 503 until the first sync completes or when the
 registry cannot be read.
+
+Each `liveness` entry also carries what the node reports about itself:
+
+```json
+{
+  "address": "0x…",
+  "status": "online",
+  "observed_at_unix": 1791046839,
+  "capabilities": ["paid_v2", "surb_v2"],
+  "build_version": "0.4.0-rc.3+59a8ea7…"
+}
+```
+
+- `capabilities` is copied from the node's `/metrics/json` (sorted, deduplicated; a list over 32
+  names or with a name outside `[A-Za-z0-9_.-]{1,64}` counts as no report). It is published
+  all or nothing: only while every online, unfrozen exit (role 2 or 3) has its own report. SDK
+  clients from 0.3.0 pick only `paid_v2` exits for paid execution once any node lists
+  capabilities, so a single unreported exit withholds the field for every node and clients keep
+  their earlier routing. `paid_v2` and `surb_v2` are never inferred from role or version.
+- `build_version` comes from the metrics body or the `x-nox-version` header; it is informational
+  and omitted when unknown.
+
+`pow_difficulty` at the top level is the highest `pow_difficulty` an online, unfrozen member
+reports in its own `/topology` (read every `NODE_TOPOLOGY_POLL_SECS`), capped at
+`SEED_MAX_POW_DIFFICULTY`; it is 0 when no member has reported one, which leaves clients on
+their default.
 
 ## Monitoring
 

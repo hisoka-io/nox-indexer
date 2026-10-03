@@ -159,13 +159,36 @@ async fn scrape_node_metrics(
 ) {
     let client = node_http_client(Some(Duration::from_secs(5)));
     let metrics_url = format!("{base_url}/metrics/json");
+    let topology_url = format!("{base_url}/topology");
     let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut topology_interval =
+        tokio::time::interval(Duration::from_secs(state.node_topology_poll_secs));
 
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 tracing::debug!("Metrics scraper cancelled for {node_address}");
                 return;
+            }
+            _ = topology_interval.tick() => {
+                match read_pow_difficulty(&client, &topology_url).await {
+                    Ok(_) if !is_registered_member(&state, &node_address) => {}
+                    Ok(Some(difficulty)) => {
+                        state
+                            .pow_difficulties
+                            .write()
+                            .insert(node_address.clone(), difficulty);
+                    }
+                    Ok(None) => {
+                        state.pow_difficulties.write().remove(&node_address);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "PoW difficulty read failed for {node_address}: {error}; \
+                             keeping the last reading"
+                        );
+                    }
+                }
             }
             _ = interval.tick() => {
                 match client.get(&metrics_url).send().await {
@@ -209,6 +232,33 @@ async fn scrape_node_metrics(
             }
         }
     }
+}
+
+/// The `pow_difficulty` field of a node's own `/topology` snapshot; the rest of
+/// the snapshot is ignored. `None` when the node's snapshot has no such field.
+#[derive(serde::Deserialize)]
+struct NodePowReport {
+    #[serde(default)]
+    pow_difficulty: Option<u32>,
+}
+
+async fn read_pow_difficulty(
+    client: &reqwest::Client,
+    topology_url: &str,
+) -> Result<Option<u32>, String> {
+    let response = client
+        .get(topology_url)
+        .send()
+        .await
+        .map_err(|error| format!("GET {topology_url}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GET {topology_url} returned {}", response.status()));
+    }
+    response
+        .json::<NodePowReport>()
+        .await
+        .map(|report| report.pow_difficulty)
+        .map_err(|error| format!("decode {topology_url}: {error}"))
 }
 
 fn now_ms() -> i64 {
@@ -410,6 +460,7 @@ pub async fn manage_subscriptions(state: AppState) {
                 }
                 sub.stop();
                 state.metrics.write().remove(addr);
+                state.pow_difficulties.write().remove(addr);
             }
         }
 
@@ -734,6 +785,56 @@ mod tests {
 
         let totals = crate::node::offsets::network_totals(state.metric_offsets.read().values());
         assert_eq!(totals.packets_received, inflated.packets_received);
+    }
+}
+
+#[cfg(test)]
+mod pow_difficulty_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_once(status: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0_u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}/topology")
+    }
+
+    #[tokio::test]
+    async fn pow_difficulty_comes_from_the_node_topology_snapshot() {
+        let client = node_http_client(Some(Duration::from_secs(5)));
+        let url = serve_once(
+            "200 OK",
+            r#"{"nodes":[],"fingerprint":"00","timestamp":1,"block_number":7,"pow_difficulty":3,"schema_version":2,"liveness":[]}"#,
+        )
+        .await;
+        assert_eq!(read_pow_difficulty(&client, &url).await, Ok(Some(3)));
+
+        let url = serve_once("200 OK", r#"{"nodes":[],"fingerprint":"00"}"#).await;
+        assert_eq!(read_pow_difficulty(&client, &url).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn failed_topology_reads_are_errors_with_the_cause() {
+        let client = node_http_client(Some(Duration::from_secs(5)));
+        let url = serve_once("503 Service Unavailable", "{}").await;
+        let error = read_pow_difficulty(&client, &url).await.unwrap_err();
+        assert!(error.contains("503"), "{error}");
+
+        let url = serve_once("200 OK", r#"{"pow_difficulty":-1}"#).await;
+        let error = read_pow_difficulty(&client, &url).await.unwrap_err();
+        assert!(error.starts_with("decode "), "{error}");
     }
 }
 

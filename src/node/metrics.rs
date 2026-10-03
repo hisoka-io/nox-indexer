@@ -66,6 +66,14 @@ pub struct StructuredMetrics {
     pub latency_p95: f64,
     pub latency_p99: f64,
     pub build_version: String,
+    /// Features the node reports about itself (`surb_v2`, `paid_v2`, ...).
+    /// `None` when the body has no `capabilities` field (builds before rc.2) or
+    /// the field is malformed; see `capabilities_from_json`.
+    #[serde(
+        deserialize_with = "capabilities_from_json",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capabilities: Option<Vec<String>>,
     #[serde(skip_serializing)]
     pub ingress_response_buffer: f64,
 
@@ -83,6 +91,47 @@ pub struct StructuredMetrics {
 
     pub egress_forwarded: f64,
     pub egress_exited: f64,
+}
+
+/// Most capabilities a node may report. Matches the SDK's limit: a longer list
+/// is dropped by clients, so it is treated as no report here.
+pub const MAX_CAPABILITIES: usize = 32;
+/// Longest capability name, matching the SDK's limit.
+pub const MAX_CAPABILITY_LEN: usize = 64;
+
+fn is_capability_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_CAPABILITY_LEN
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// Accepts the node's `capabilities` array only when it is well formed: at most
+/// `MAX_CAPABILITIES` names, each a short `[A-Za-z0-9_.-]` token. Anything else
+/// (wrong type, oversized, an invalid name) is `None`, the same as a node that
+/// reports no capabilities, so the rest of the metrics body still parses.
+fn capabilities_from_json<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let serde_json::Value::Array(entries) = value else {
+        return Ok(None);
+    };
+    if entries.len() > MAX_CAPABILITIES {
+        return Ok(None);
+    }
+    let mut names = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            serde_json::Value::String(name) if is_capability_name(&name) => names.push(name),
+            _ => return Ok(None),
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(Some(names))
 }
 
 /// Response header in which nodes report their build version. Their JSON
@@ -138,6 +187,55 @@ mod tests {
         metrics.fill_build_version(Some(&format!("<b>v1</b>\n{}", "x".repeat(500))));
         assert!(metrics.build_version.starts_with("<b>v1</b>x"));
         assert_eq!(metrics.build_version.len(), 128);
+    }
+
+    #[test]
+    fn capabilities_are_read_from_the_node_body() {
+        let metrics: StructuredMetrics = serde_json::from_str(
+            r#"{"capabilities": ["surb_v2", "paid_v2", "surb_v2"], "packetsReceived": 4}"#,
+        )
+        .expect("rc.3 metrics fixture must decode");
+        assert_eq!(
+            metrics.capabilities,
+            Some(vec!["paid_v2".to_string(), "surb_v2".to_string()])
+        );
+        assert_eq!(metrics.packets_received, 4.0);
+
+        let empty: StructuredMetrics =
+            serde_json::from_str(r#"{"capabilities": []}"#).expect("empty list must decode");
+        assert_eq!(empty.capabilities, Some(Vec::new()));
+    }
+
+    #[test]
+    fn missing_or_malformed_capabilities_are_no_report() {
+        let legacy: StructuredMetrics =
+            serde_json::from_str(r#"{"packetsReceived": 1}"#).expect("rc.1 body must decode");
+        assert_eq!(legacy.capabilities, None);
+
+        let too_many = format!(
+            r#"{{"capabilities": [{}], "packetsReceived": 2}}"#,
+            (0..=super::MAX_CAPABILITIES)
+                .map(|i| format!("\"cap{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for body in [
+            r#"{"capabilities": null, "packetsReceived": 2}"#.to_string(),
+            r#"{"capabilities": "paid_v2", "packetsReceived": 2}"#.to_string(),
+            r#"{"capabilities": ["paid_v2", 7], "packetsReceived": 2}"#.to_string(),
+            r#"{"capabilities": ["paid_v2", ""], "packetsReceived": 2}"#.to_string(),
+            r#"{"capabilities": ["paid v2"], "packetsReceived": 2}"#.to_string(),
+            format!(
+                r#"{{"capabilities": ["{}"], "packetsReceived": 2}}"#,
+                "a".repeat(65)
+            ),
+            too_many,
+        ] {
+            let metrics: StructuredMetrics =
+                serde_json::from_str(&body).expect("a bad capability list must not fail the body");
+            assert_eq!(metrics.capabilities, None, "{body}");
+            assert_eq!(metrics.packets_received, 2.0, "{body}");
+        }
     }
 
     #[test]
