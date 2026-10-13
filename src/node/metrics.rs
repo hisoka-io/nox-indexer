@@ -66,7 +66,7 @@ pub struct StructuredMetrics {
     pub latency_p95: f64,
     pub latency_p99: f64,
     pub build_version: String,
-    /// Features the node reports about itself (`surb_v2`, `paid_v2`, ...).
+    /// Features the node reports about itself (`surb_v2`, `paid_v2`, `tunnel_v1`, ...).
     /// `None` when the body has no `capabilities` field (builds before rc.2) or
     /// the field is malformed; see `capabilities_from_json`.
     #[serde(
@@ -200,6 +200,19 @@ mod tests {
             Some(vec!["paid_v2".to_string(), "surb_v2".to_string()])
         );
         assert_eq!(metrics.packets_received, 4.0);
+
+        let exit: StructuredMetrics = serde_json::from_str(
+            r#"{"capabilities": ["tunnel_v1", "surb_v2", "paid_v2"], "packetsReceived": 4}"#,
+        )
+        .expect("rc.10 exit metrics fixture must decode");
+        assert_eq!(
+            exit.capabilities,
+            Some(vec![
+                "paid_v2".to_string(),
+                "surb_v2".to_string(),
+                "tunnel_v1".to_string()
+            ])
+        );
 
         let empty: StructuredMetrics =
             serde_json::from_str(r#"{"capabilities": []}"#).expect("empty list must decode");
