@@ -141,8 +141,8 @@ Each `liveness` entry also carries what the node reports about itself:
   "address": "0x…",
   "status": "online",
   "observed_at_unix": 1791046839,
-  "capabilities": ["paid_v2", "surb_v2"],
-  "build_version": "0.4.0-rc.3+59a8ea7…"
+  "capabilities": ["paid_v2", "surb_v2", "tunnel_v1"],
+  "build_version": "0.4.0-rc.10+5bafb1f…"
 }
 ```
 
@@ -151,7 +151,8 @@ Each `liveness` entry also carries what the node reports about itself:
   all or nothing: only while every online, unfrozen exit (role 2 or 3) has its own report. SDK
   clients from 0.3.0 pick only `paid_v2` exits for paid execution once any node lists
   capabilities, so a single unreported exit withholds the field for every node and clients keep
-  their earlier routing. `paid_v2` and `surb_v2` are never inferred from role or version.
+  their earlier routing. `paid_v2`, `surb_v2` and `tunnel_v1` (an exit that relays end-to-end
+  TLS tunnels) are never inferred from role or version.
 - `build_version` comes from the metrics body or the `x-nox-version` header; it is informational
   and omitted when unknown.
 
