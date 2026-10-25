@@ -15,11 +15,12 @@ use crate::broadcast::cluster_snapshot_json;
 use crate::node::offsets::network_totals;
 use crate::state::{AppState, CachedSeed, NodeState, NodeStatus, SyncPhase};
 
-/// A pinned seed snapshot is reused for this long unless membership changes.
-const SEED_CACHE_TTL: Duration = Duration::from_secs(30);
-/// When a rebuild fails, a cached snapshot this young is still served. Its block
-/// stays recent enough for non-archive RPCs to verify against.
-const SEED_STALE_MAX: Duration = Duration::from_secs(600);
+/// A pinned seed snapshot younger than this is served as is.
+pub(crate) const SEED_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Bound on staleness: an older snapshot (same membership) is served at once
+/// while one background task re-verifies it, and is never served past this age.
+/// Its block stays recent enough for non-archive RPCs to verify against.
+pub(crate) const SEED_STALE_MAX: Duration = Duration::from_secs(300);
 
 #[derive(Serialize)]
 struct SeedTopologyNode {
@@ -310,8 +311,124 @@ pub async fn handle_seed_topology(State(state): State<AppState>) -> impl IntoRes
     }
 }
 
-/// Chain-pinned members at the last processed block, cached per topology version.
+/// How a request uses the cached seed members.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedCacheUse {
+    /// Younger than `SEED_CACHE_TTL`: serve it.
+    Fresh,
+    /// Same membership, younger than `SEED_STALE_MAX`: serve it and refresh in the background.
+    Stale,
+    /// Missing, membership changed, or too old: verify again before answering.
+    Rebuild,
+}
+
+fn seed_cache_use(cached: Option<&CachedSeed>, version: u64, now: Instant) -> SeedCacheUse {
+    let Some(cached) = cached else {
+        return SeedCacheUse::Rebuild;
+    };
+    if cached.topology_version != version {
+        return SeedCacheUse::Rebuild;
+    }
+    let age = now.saturating_duration_since(cached.built_at);
+    if age < SEED_CACHE_TTL {
+        SeedCacheUse::Fresh
+    } else if age < SEED_STALE_MAX {
+        SeedCacheUse::Stale
+    } else {
+        SeedCacheUse::Rebuild
+    }
+}
+
+/// Chain-pinned members for `/seed/topology`, served stale-while-revalidate.
+///
+/// Only members that passed the on-chain check (count, fingerprint, and each
+/// profile at the pinned block) are ever cached, so a failed check is never
+/// served. A cached copy serves requests until `SEED_STALE_MAX`; past that, or
+/// after a membership change, the request waits for a fresh check.
 async fn pinned_seed_members(state: &AppState) -> Result<CachedSeed, String> {
+    let version = state.topology_version();
+    let cached = state.seed_cache.lock().await.clone();
+    match seed_cache_use(cached.as_ref(), version, Instant::now()) {
+        SeedCacheUse::Fresh => cached.ok_or_else(|| "seed cache emptied".to_string()),
+        SeedCacheUse::Stale => {
+            spawn_seed_refresh(state);
+            cached.ok_or_else(|| "seed cache emptied".to_string())
+        }
+        SeedCacheUse::Rebuild => match refresh_seed_cache(state).await {
+            Ok(fresh) => Ok(fresh),
+            Err(error) => match cached {
+                Some(cached) if cached.built_at.elapsed() < SEED_STALE_MAX => {
+                    tracing::warn!(
+                        "Seed rebuild failed, serving verified block {}: {error}",
+                        cached.block
+                    );
+                    Ok(cached)
+                }
+                _ => Err(error),
+            },
+        },
+    }
+}
+
+/// Re-verifies the members and stores them, unless another task stored a
+/// fresh copy for the current membership while this one waited its turn.
+pub(crate) async fn refresh_seed_cache(state: &AppState) -> Result<CachedSeed, String> {
+    let _turn = state.seed_refresh.lock().await;
+    let version = state.topology_version();
+    if let Some(cached) = state.seed_cache.lock().await.as_ref() {
+        if seed_cache_use(Some(cached), version, Instant::now()) == SeedCacheUse::Fresh {
+            return Ok(cached.clone());
+        }
+    }
+    let fresh = verify_seed_members(state).await?;
+    *state.seed_cache.lock().await = Some(fresh.clone());
+    Ok(fresh)
+}
+
+/// Starts one background refresh; does nothing while a refresh is running.
+fn spawn_seed_refresh(state: &AppState) {
+    let Ok(turn) = state.seed_refresh.clone().try_lock_owned() else {
+        return;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _turn = turn;
+        match verify_seed_members(&state).await {
+            Ok(fresh) => *state.seed_cache.lock().await = Some(fresh),
+            Err(error) => tracing::warn!("Background seed refresh failed: {error}"),
+        }
+    });
+}
+
+/// Keeps the seed cache younger than `SEED_STALE_MAX` while nobody asks, so
+/// requests after an idle spell are served from the cache too.
+pub async fn seed_warm_loop(state: AppState, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = state.shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        if !seed_sync_ready(&state) {
+            continue;
+        }
+        if let Err(error) = refresh_seed_cache(&state).await {
+            tracing::warn!("Seed warm refresh failed: {error}");
+        }
+    }
+}
+
+fn seed_sync_ready(state: &AppState) -> bool {
+    let sync = state.sync.read();
+    !matches!(
+        (sync.phase, sync.last_block),
+        (SyncPhase::Starting, _) | (_, None) | (_, Some(0))
+    )
+}
+
+/// Reads the replayed members at the last processed block and checks them on chain.
+async fn verify_seed_members(state: &AppState) -> Result<CachedSeed, String> {
     let block_number = {
         let sync = state.sync.read();
         match (sync.phase, sync.last_block) {
@@ -322,13 +439,6 @@ async fn pinned_seed_members(state: &AppState) -> Result<CachedSeed, String> {
         }
     };
     let version = state.topology_version();
-
-    let mut cache = state.seed_cache.lock().await;
-    if let Some(cached) = cache.as_ref() {
-        if cached.topology_version == version && cached.built_at.elapsed() < SEED_CACHE_TTL {
-            return Ok(cached.clone());
-        }
-    }
 
     let mut member_addresses: Vec<String> = state
         .nodes
@@ -342,33 +452,17 @@ async fn pinned_seed_members(state: &AppState) -> Result<CachedSeed, String> {
         return Err("no replayed registered members are available".to_string());
     }
 
-    match state
+    let (members, fingerprint) = state
         .chain
         .pinned_topology_members(&member_addresses, block_number)
-        .await
-    {
-        Ok((members, fingerprint)) => {
-            let fresh = CachedSeed {
-                block: block_number,
-                topology_version: version,
-                built_at: Instant::now(),
-                members,
-                fingerprint,
-            };
-            *cache = Some(fresh.clone());
-            Ok(fresh)
-        }
-        Err(error) => match cache.as_ref() {
-            Some(cached) if cached.built_at.elapsed() < SEED_STALE_MAX => {
-                tracing::warn!(
-                    "Seed rebuild at block {block_number} failed, serving block {}: {error}",
-                    cached.block
-                );
-                Ok(cached.clone())
-            }
-            _ => Err(error),
-        },
-    }
+        .await?;
+    Ok(CachedSeed {
+        block: block_number,
+        topology_version: version,
+        built_at: Instant::now(),
+        members,
+        fingerprint,
+    })
 }
 
 async fn build_seed_topology(state: &AppState) -> Result<SeedTopologySnapshot, String> {
@@ -563,6 +657,105 @@ async fn handle_ws_connection(mut socket: WebSocket, state: AppState) {
 mod tests {
     use super::*;
     use crate::chain::PinnedTopologyNode;
+
+    fn cached_seed(version: u64, age: Duration) -> CachedSeed {
+        CachedSeed {
+            block: 100,
+            topology_version: version,
+            built_at: Instant::now()
+                .checked_sub(age)
+                .expect("test ages fit in the monotonic clock"),
+            members: vec![member(RELAY)],
+            fingerprint: "0xfeed".to_string(),
+        }
+    }
+
+    fn synced_state() -> AppState {
+        let state = AppState::for_tests();
+        {
+            let mut sync = state.sync.write();
+            sync.phase = SyncPhase::Live;
+            sync.last_block = Some(200);
+        }
+        state
+    }
+
+    #[test]
+    fn seed_cache_use_follows_age_and_membership() {
+        let now = Instant::now();
+        let at = |age_secs: u64| CachedSeed {
+            built_at: now
+                .checked_sub(Duration::from_secs(age_secs))
+                .expect("test ages fit in the monotonic clock"),
+            ..cached_seed(3, Duration::ZERO)
+        };
+        assert_eq!(seed_cache_use(None, 3, now), SeedCacheUse::Rebuild);
+        assert_eq!(seed_cache_use(Some(&at(0)), 3, now), SeedCacheUse::Fresh);
+        assert_eq!(seed_cache_use(Some(&at(29)), 3, now), SeedCacheUse::Fresh);
+        assert_eq!(seed_cache_use(Some(&at(30)), 3, now), SeedCacheUse::Stale);
+        assert_eq!(seed_cache_use(Some(&at(299)), 3, now), SeedCacheUse::Stale);
+        assert_eq!(
+            seed_cache_use(Some(&at(300)), 3, now),
+            SeedCacheUse::Rebuild
+        );
+        // A membership change always waits for a fresh check, however young the copy.
+        assert_eq!(seed_cache_use(Some(&at(0)), 4, now), SeedCacheUse::Rebuild);
+    }
+
+    #[tokio::test]
+    async fn stale_seed_is_served_at_once_and_a_failed_refresh_keeps_it() {
+        // No replayed members, so the background refresh fails its check.
+        let state = synced_state();
+        let stale = cached_seed(0, Duration::from_secs(120));
+        *state.seed_cache.lock().await = Some(stale.clone());
+
+        let started = Instant::now();
+        let served = pinned_seed_members(&state)
+            .await
+            .expect("a stale copy inside the bound is served");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(served.block, stale.block);
+        assert_eq!(served.built_at, stale.built_at);
+
+        // Wait for the background refresh to finish; its failure must not touch the cache.
+        let _turn = state.seed_refresh.lock().await;
+        let kept = state.seed_cache.lock().await.clone().expect("cache kept");
+        assert_eq!(kept.built_at, stale.built_at);
+    }
+
+    #[tokio::test]
+    async fn seed_past_the_staleness_bound_is_not_served_when_verification_fails() {
+        let state = synced_state();
+        *state.seed_cache.lock().await = Some(cached_seed(0, SEED_STALE_MAX));
+        let error = pinned_seed_members(&state)
+            .await
+            .expect_err("an expired copy must not be served");
+        assert!(error.contains("no replayed registered members"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn seed_is_never_served_before_any_verification() {
+        let state = synced_state();
+        assert!(pinned_seed_members(&state).await.is_err());
+        assert!(state.seed_cache.lock().await.is_none());
+
+        let unsynced = AppState::for_tests();
+        let error = pinned_seed_members(&unsynced)
+            .await
+            .expect_err("sync pending");
+        assert!(error.contains("chain sync has not completed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn only_one_background_refresh_runs_at_a_time() {
+        let state = synced_state();
+        let held = state.seed_refresh.clone().lock_owned().await;
+        spawn_seed_refresh(&state);
+        // The refresh slot is taken, so no task was started and the lock is still ours.
+        assert!(state.seed_refresh.try_lock().is_err());
+        drop(held);
+        assert!(state.seed_refresh.try_lock().is_ok());
+    }
 
     fn member(address: &str) -> PinnedTopologyNode {
         PinnedTopologyNode {

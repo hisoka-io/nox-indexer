@@ -42,6 +42,7 @@ All options are configurable via env vars or CLI flags. See `.env.sample` for de
 | `HEALTH_MAX_SYNC_AGE_SECS` | Sync age above which `/healthz/sync` returns 503 (default 300) | No |
 | `NODE_TOPOLOGY_POLL_SECS` | Seconds between reads of each node's `/topology` for its PoW difficulty (default 60) | No |
 | `SEED_MAX_POW_DIFFICULTY` | Ceiling on the seed's `pow_difficulty` (default 16, the most SDK clients adopt) | No |
+| `SEED_WARM_SECS` | Seconds between background re-checks of the seed members, 1-299 (default 240) | No |
 | `ALLOW_PRIVATE_NODE_ADDRESSES` | Poll loopback/private node addresses outside localtestnet (default false) | No |
 | `RUST_LOG` | Log filter (default `info`) | No |
 
@@ -74,7 +75,7 @@ instead of exiting.
 - A registry upgrade that changes the `relayers()` layout must ship with an indexer release that
   decodes it. Until then sync retries forever, `indexer.last_error` reads "registry layout not
   supported by this indexer version", `/healthz/sync` returns 503 and `/seed/topology` returns 503
-  once its cached snapshot is older than 10 minutes.
+  once its cached snapshot is older than 5 minutes.
 
 ### Node polling
 
@@ -130,9 +131,13 @@ Roles stored in Postgres are refreshed from chain on every boot sync.
 with profiles read at the last processed block (a few seconds behind head), and its count and
 fingerprint are checked against the registry at that block. `liveness` is a separate
 online/offline observation for the same member set; frozen members stay in `nodes` (the
-fingerprint includes them) but are always `offline`. Snapshots are cached for 30s and rebuilt
-when membership changes; the endpoint returns 503 until the first sync completes or when the
-registry cannot be read.
+fingerprint includes them) but are always `offline`. The verified member set is served
+stale-while-revalidate: a copy younger than 30 s is served as is; a copy up to 5 minutes old is
+served at once while one background task re-checks it on chain; a background loop re-checks it
+every `SEED_WARM_SECS` so idle periods stay inside that bound. A membership change, or a copy past
+5 minutes, waits for a fresh check. Only member sets that passed the on-chain check are cached,
+so a failed check is never served. The endpoint returns 503 until the first sync completes or
+when the registry cannot be read and no verified copy younger than 5 minutes exists.
 
 Each `liveness` entry also carries what the node reports about itself:
 
