@@ -95,6 +95,11 @@ pub struct Args {
     /// (16 matches the most an SDK client adopts from a seed)
     #[arg(long, env = "SEED_MAX_POW_DIFFICULTY", default_value = "16")]
     pub seed_max_pow_difficulty: u32,
+
+    /// Seconds between background re-checks of the `/seed/topology` members, so
+    /// the cached copy stays inside its 300 s staleness bound while idle (1-299)
+    #[arg(long, env = "SEED_WARM_SECS", default_value = "240")]
+    pub seed_warm_secs: u64,
 }
 
 pub struct NetworkConfig {
@@ -173,6 +178,7 @@ mod tests {
             settlement_from_block: None,
             node_topology_poll_secs: 60,
             seed_max_pow_difficulty: 16,
+            seed_warm_secs: 240,
         }
     }
 

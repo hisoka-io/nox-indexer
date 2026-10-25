@@ -77,7 +77,21 @@ async fn main() {
 
     let state = init_state(&args, chain_config.clone(), shutdown).await;
 
+    let seed_warm = Duration::from_secs(args.seed_warm_secs);
+    if seed_warm.is_zero() || seed_warm >= api::SEED_STALE_MAX {
+        eprintln!(
+            "SEED_WARM_SECS must be between 1 and {} (the seed staleness bound), got {}",
+            api::SEED_STALE_MAX.as_secs() - 1,
+            args.seed_warm_secs
+        );
+        std::process::exit(1);
+    }
+
     let mut handles = spawn_background_tasks(&state, &chain_config, args.uptime_check_interval);
+    let s = state.clone();
+    handles.push(tokio::spawn(async move {
+        api::seed_warm_loop(s, seed_warm).await
+    }));
     if let Some(config) = settlement_config {
         let s = state.clone();
         let c = chain_config.clone();
@@ -212,6 +226,7 @@ async fn init_state(
         })),
         topology_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         seed_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        seed_refresh: Arc::new(tokio::sync::Mutex::new(())),
         probe_now: Arc::new(tokio::sync::Notify::new()),
         network_genesis_ms: Arc::new(RwLock::new(network_genesis_ms)),
         max_sync_age_secs: args.health_max_sync_age_secs,

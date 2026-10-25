@@ -334,8 +334,8 @@ pub(crate) fn serialize_public_error<S: serde::Serializer>(
     }
 }
 
-/// Chain-pinned topology members, rebuilt lazily by `/seed/topology`.
-#[derive(Clone)]
+/// Chain-pinned topology members for `/seed/topology` (stale-while-revalidate, see `api`).
+#[derive(Clone, Debug)]
 pub struct CachedSeed {
     pub block: u64,
     pub topology_version: u64,
@@ -368,6 +368,8 @@ pub struct AppState {
     /// Bumped whenever registry membership or a profile changes, invalidating the seed cache.
     pub topology_version: Arc<AtomicU64>,
     pub seed_cache: Arc<tokio::sync::Mutex<Option<CachedSeed>>>,
+    /// Held by the one task verifying a new seed copy (request path, background or warm loop).
+    pub seed_refresh: Arc<tokio::sync::Mutex<()>>,
     /// Wakes the uptime loop so new members are probed without waiting a full interval.
     pub probe_now: Arc<Notify>,
     /// Earliest evidence of the network (first uptime check), in Unix ms.
@@ -445,6 +447,7 @@ impl AppState {
             sync: Arc::default(),
             topology_version: Arc::default(),
             seed_cache: Arc::default(),
+            seed_refresh: Arc::default(),
             probe_now: Arc::default(),
             network_genesis_ms: Arc::default(),
             max_sync_age_secs: 300,
