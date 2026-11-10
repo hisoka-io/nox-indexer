@@ -57,6 +57,7 @@ impl Db {
             include_str!("../migrations/004_metric_offsets.sql"),
             include_str!("../migrations/005_registry_checkpoints.sql"),
             include_str!("../migrations/006_paid_settlements.sql"),
+            include_str!("../migrations/007_metric_offsets_first_seen.sql"),
         ];
 
         for file in migration_files {
@@ -266,15 +267,15 @@ impl Db {
     /// a warning rather than aborting startup, so one corrupt row cannot take the
     /// indexer down.
     pub async fn load_metric_offsets(&self) -> Result<HashMap<String, NodeOffset>, sqlx::Error> {
-        let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
-            "SELECT address, last_node_start_time, offsets::text, last_raw::text
+        let rows: Vec<(String, i64, String, String, i64)> = sqlx::query_as(
+            "SELECT address, last_node_start_time, offsets::text, last_raw::text, first_seen_ms
              FROM node_metric_offsets",
         )
         .fetch_all(&self.pool)
         .await?;
 
         let mut out = HashMap::with_capacity(rows.len());
-        for (address, last_node_start_time, offsets, last_raw) in rows {
+        for (address, last_node_start_time, offsets, last_raw, first_seen_ms) in rows {
             let banked = match serde_json::from_str::<CumulativeMetrics>(&offsets) {
                 Ok(v) => v,
                 Err(e) => {
@@ -289,6 +290,7 @@ impl Db {
                     last_node_start_time,
                     banked,
                     last_raw,
+                    first_seen_ms,
                     ..NodeOffset::default()
                 },
             );
@@ -309,19 +311,27 @@ impl Db {
 
         sqlx::query(
             "INSERT INTO node_metric_offsets
-                 (address, last_node_start_time, offsets, last_raw, updated_at_ms)
-             VALUES ($1, $2, $3::jsonb, $4::jsonb, $5)
+                 (address, last_node_start_time, offsets, last_raw, updated_at_ms, first_seen_ms)
+             VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6)
              ON CONFLICT (address) DO UPDATE SET
                  last_node_start_time = EXCLUDED.last_node_start_time,
                  offsets              = EXCLUDED.offsets,
                  last_raw             = EXCLUDED.last_raw,
-                 updated_at_ms        = EXCLUDED.updated_at_ms",
+                 updated_at_ms        = EXCLUDED.updated_at_ms,
+                 first_seen_ms        = CASE
+                     WHEN node_metric_offsets.first_seen_ms > 0
+                          AND (EXCLUDED.first_seen_ms <= 0
+                               OR node_metric_offsets.first_seen_ms < EXCLUDED.first_seen_ms)
+                     THEN node_metric_offsets.first_seen_ms
+                     ELSE EXCLUDED.first_seen_ms
+                 END",
         )
         .bind(address)
         .bind(offset.last_node_start_time)
         .bind(&banked)
         .bind(&last_raw)
         .bind(now_ms)
+        .bind(offset.first_seen_ms)
         .execute(&self.pool)
         .await?;
 

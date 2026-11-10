@@ -198,7 +198,8 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
 
     let (totals, totals_nodes) = {
         let offsets = state.metric_offsets.read();
-        (network_totals(offsets.values()), offsets.len())
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        (network_totals(offsets.values(), now_ms), offsets.len())
     };
     let mut network_totals_json = totals.to_camel_case_json();
     // Nodes whose counters feed the totals (every node ever scraped). This is

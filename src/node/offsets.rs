@@ -8,8 +8,13 @@
 //! reading. The result is a continuous lifetime figure for the dashboard.
 //!
 //! Only monotonically increasing counters are offset. Gauges (queue depths,
-//! active peers, latency percentiles, health) reflect instantaneous state and
-//! are passed through untouched.
+//! active peers, health) reflect instantaneous state and are passed through
+//! untouched.
+//!
+//! Lifetime uptime is also capped at the wall time since the indexer first saw
+//! the node ([`NodeOffset::first_seen_ms`]). Uptime is self-reported, so a node
+//! that ran before the indexer first saw it would otherwise show more uptime
+//! than the indexer has evidence for.
 //!
 //! Counters are self-reported by registrants, so a reading is never taken at
 //! face value. Each counter may only move forward, and its growth is limited
@@ -197,11 +202,14 @@ fn snake_to_camel(key: &str) -> String {
 /// status: each node's banked prior incarnations plus the latest reading of its
 /// current one. For a node still being scraped this equals its live `metrics`
 /// value; for a deregistered node it is the last lifetime value seen.
-pub fn network_totals<'a>(offsets: impl IntoIterator<Item = &'a NodeOffset>) -> CumulativeMetrics {
+/// Uptime is capped per node as in [`NodeOffset::lifetime`].
+pub fn network_totals<'a>(
+    offsets: impl IntoIterator<Item = &'a NodeOffset>,
+    now_ms: i64,
+) -> CumulativeMetrics {
     let mut total = CumulativeMetrics::default();
     for offset in offsets {
-        total.accumulate(&offset.banked);
-        total.accumulate(&offset.last_raw);
+        total.accumulate(&offset.lifetime(now_ms));
     }
     total
 }
@@ -217,6 +225,9 @@ pub struct NodeOffset {
     /// Accepted counters of the current incarnation (the latest reading after
     /// the checks in [`CumulativeMetrics::advance_toward`]). Banked on next restart.
     pub last_raw: CumulativeMetrics,
+    /// Unix ms at which the indexer first saw this node; zero until known.
+    /// Lifetime uptime never exceeds the wall time since then.
+    pub first_seen_ms: i64,
     /// Set when state changed and has not yet been flushed to Postgres.
     pub dirty: bool,
     /// When the previous reading was observed in this process. Not persisted.
@@ -252,8 +263,19 @@ impl NodeOffset {
     /// an incarnation, and may not grow by more than the allowance built up at
     /// their rate ceilings. A new incarnation starts from zero and the allowance
     /// carries over, so the ceilings also hold across restarts.
-    pub fn observe(&mut self, m: &StructuredMetrics, now: Instant) -> Observation {
+    ///
+    /// `now_ms` is the wall clock (Unix ms) and sets [`Self::first_seen_ms`] on
+    /// the first reading of a node with no history.
+    pub fn observe(&mut self, m: &StructuredMetrics, now: Instant, now_ms: i64) -> Observation {
         let start = m.node_start_time as i64;
+
+        // Only a node with no history starts its first-seen clock here; one
+        // persisted before first-seen existed waits for `backfill_first_seen`.
+        if self.first_seen_ms <= 0 && now_ms > 0 && self.banked.is_zero() && self.last_raw.is_zero()
+        {
+            self.first_seen_ms = now_ms;
+            self.dirty = true;
+        }
 
         let restarted = if start > 0 && self.last_node_start_time > 0 {
             start != self.last_node_start_time
@@ -299,12 +321,31 @@ impl NodeOffset {
         }
     }
 
-    /// Replace the counters of a live reading with this node's lifetime totals:
-    /// banked prior incarnations plus the accepted current ones.
-    pub fn apply(&self, m: &mut StructuredMetrics) {
+    /// Set [`Self::first_seen_ms`] for a node persisted before it existed.
+    /// `earliest_ms` is the network's earliest evidence (`network_genesis_ms`).
+    pub fn backfill_first_seen(&mut self, earliest_ms: i64) {
+        if self.first_seen_ms <= 0 && earliest_ms > 0 {
+            self.first_seen_ms = earliest_ms;
+            self.dirty = true;
+        }
+    }
+
+    /// Banked prior incarnations plus the accepted current ones, with uptime
+    /// capped at the wall time since the node was first seen.
+    pub fn lifetime(&self, now_ms: i64) -> CumulativeMetrics {
         let mut lifetime = self.banked.clone();
         lifetime.accumulate(&self.last_raw);
-        lifetime.write_into(m);
+        if self.first_seen_ms > 0 {
+            let seen_for_secs = (now_ms.saturating_sub(self.first_seen_ms) / 1_000).max(0) as f64;
+            lifetime.uptime_seconds = lifetime.uptime_seconds.min(seen_for_secs);
+        }
+        lifetime
+    }
+
+    /// Replace the counters of a live reading with this node's lifetime totals
+    /// (see [`Self::lifetime`]).
+    pub fn apply(&self, m: &mut StructuredMetrics, now_ms: i64) {
+        self.lifetime(now_ms).write_into(m);
     }
 }
 
@@ -332,12 +373,14 @@ mod tests {
 
         fn observe_after(&mut self, gap: Duration, m: &StructuredMetrics) -> Observation {
             self.now += gap;
-            self.offset.observe(m, self.now)
+            self.offset.observe(m, self.now, 0)
         }
 
+        /// Readings without a wall clock: no first-seen time, so uptime is
+        /// never capped (see `uptime_never_exceeds_the_time_since_first_seen`).
         fn live(&self, m: &StructuredMetrics) -> StructuredMetrics {
             let mut live = m.clone();
-            self.offset.apply(&mut live);
+            self.offset.apply(&mut live, 0);
             live
         }
     }
@@ -442,7 +485,7 @@ mod tests {
         let mut b = Scraper::new();
         b.observe(&reading(3000, 40.0, 400.0));
 
-        let totals = network_totals([&a.offset, &b.offset]);
+        let totals = network_totals([&a.offset, &b.offset], 0);
         assert_eq!(totals.packets_received, live_a.packets_received + 400.0);
         assert_eq!(totals.packets_received, 1_450.0);
         assert_eq!(totals.uptime_seconds, 150.0);
@@ -571,7 +614,7 @@ mod tests {
         for start in 1..=10 {
             s.observe(&reading(1000 + start, 1.0, 1.0e12));
         }
-        let totals = network_totals([&s.offset]);
+        let totals = network_totals([&s.offset], 0);
         // 60s on first sight, then 5s per reading.
         assert_eq!(totals.packets_received, 60_000.0 + 9.0 * 5_000.0);
     }
@@ -669,13 +712,132 @@ mod tests {
             },
             ..NodeOffset::default()
         };
-        let before = network_totals([&offset]);
+        let before = network_totals([&offset], 0);
 
         // The node kept running through the indexer deploy.
-        let seen = offset.observe(&reading(1000, 600_090.0, 300_050.0), Instant::now());
+        let seen = offset.observe(&reading(1000, 600_090.0, 300_050.0), Instant::now(), 0);
         assert_eq!(seen, Observation::default());
-        let after = network_totals([&offset]);
+        let after = network_totals([&offset], 0);
         assert_eq!(after.packets_received, before.packets_received + 50.0);
         assert_eq!(after.uptime_seconds, before.uptime_seconds + 90.0);
+    }
+
+    /// What `Db::save_metric_offset` stores and `Db::load_metric_offsets`
+    /// returns: everything else starts empty in a new indexer process.
+    fn persisted(offset: &NodeOffset) -> NodeOffset {
+        NodeOffset {
+            last_node_start_time: offset.last_node_start_time,
+            banked: offset.banked.clone(),
+            last_raw: offset.last_raw.clone(),
+            first_seen_ms: offset.first_seen_ms,
+            ..NodeOffset::default()
+        }
+    }
+
+    #[test]
+    fn uptime_never_exceeds_the_time_since_first_seen() {
+        // A node that ran for ten days before the indexer first saw it,
+        // scraped every 5s through a node restart and two indexer restarts.
+        let first_seen_ms: i64 = 1_800_000_000_000;
+        let mut wall_ms = first_seen_ms - 5_000;
+        let mut now = Instant::now();
+        let mut offset = NodeOffset::default();
+        let mut node_start: i64 = 1_799_136_000;
+        let mut uptime = 864_000.0;
+        let mut uncapped_exceeded = false;
+
+        let scrape =
+            |offset: &mut NodeOffset, start: i64, uptime: f64, wall_ms: i64, now: Instant| {
+                let m = reading(start, uptime, 0.0);
+                offset.observe(&m, now, wall_ms);
+                let mut live = m.clone();
+                offset.apply(&mut live, wall_ms);
+                let seen_for = ((wall_ms - first_seen_ms) / 1_000) as f64;
+                assert!(
+                    live.uptime_seconds <= seen_for,
+                    "{} > {seen_for}",
+                    live.uptime_seconds
+                );
+                let totals = network_totals([&*offset], wall_ms);
+                assert!(totals.uptime_seconds <= seen_for);
+                let mut raw = offset.banked.clone();
+                raw.accumulate(&offset.last_raw);
+                raw.uptime_seconds > seen_for
+            };
+
+        for run in 0..3 {
+            for _ in 0..720 {
+                wall_ms += 5_000;
+                now += Duration::from_secs(5);
+                uptime += 5.0;
+                uncapped_exceeded |= scrape(&mut offset, node_start, uptime, wall_ms, now);
+            }
+            if run == 0 {
+                // The node restarts between the first and second indexer runs.
+                node_start = wall_ms / 1_000;
+                uptime = 0.0;
+            }
+            // Indexer restart: only the persisted fields survive, after 30s down.
+            offset = persisted(&offset);
+            wall_ms += 30_000;
+            now += Duration::from_secs(30);
+            uptime += 30.0;
+        }
+
+        assert_eq!(offset.first_seen_ms, first_seen_ms);
+        assert!(uncapped_exceeded, "the scenario must exercise the cap");
+    }
+
+    #[test]
+    fn nodes_persisted_before_first_seen_existed_are_capped_at_genesis() {
+        let genesis_ms: i64 = 1_775_782_807_014;
+        let mut offset = NodeOffset {
+            last_node_start_time: 1000,
+            banked: CumulativeMetrics {
+                uptime_seconds: 17_000_000.0,
+                ..Default::default()
+            },
+            last_raw: CumulativeMetrics {
+                uptime_seconds: 1_800_000.0,
+                ..Default::default()
+            },
+            ..NodeOffset::default()
+        };
+        offset.backfill_first_seen(genesis_ms);
+        assert!(offset.dirty);
+        let now_ms = genesis_ms + 18_556_359_000;
+        assert_eq!(offset.lifetime(now_ms).uptime_seconds, 18_556_359.0);
+
+        // A later reading never moves first-seen forward.
+        offset.observe(
+            &reading(1000, 1_800_005.0, 0.0),
+            Instant::now(),
+            now_ms + 5_000,
+        );
+        assert_eq!(offset.first_seen_ms, genesis_ms);
+        offset.backfill_first_seen(genesis_ms + 1);
+        assert_eq!(offset.first_seen_ms, genesis_ms);
+    }
+
+    #[test]
+    fn a_persisted_node_without_first_seen_waits_for_the_backfill() {
+        let mut offset = NodeOffset {
+            last_node_start_time: 1000,
+            last_raw: CumulativeMetrics {
+                uptime_seconds: 600_000.0,
+                ..Default::default()
+            },
+            ..NodeOffset::default()
+        };
+        let now_ms: i64 = 1_800_000_000_000;
+        offset.observe(&reading(1000, 600_005.0, 0.0), Instant::now(), now_ms);
+        assert_eq!(offset.first_seen_ms, 0);
+        assert_eq!(offset.lifetime(now_ms).uptime_seconds, 600_005.0);
+
+        // A node with no history starts the clock on its first reading.
+        let mut fresh = NodeOffset::default();
+        fresh.observe(&reading(2000, 600_000.0, 0.0), Instant::now(), now_ms);
+        assert_eq!(fresh.first_seen_ms, now_ms);
+        assert_eq!(fresh.lifetime(now_ms + 10_000).uptime_seconds, 10.0);
     }
 }
