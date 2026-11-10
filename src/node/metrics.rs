@@ -81,7 +81,13 @@ pub struct StructuredMetrics {
     pub exit_ethereum: f64,
     pub exit_traffic: f64,
 
+    /// Paid transaction requests whose quote passed the exit's profitability
+    /// check (node counter `nox_profitability_outcomes_total{result="accepted"}`),
+    /// counted per request over the node's lifetime. Not a count of settled or
+    /// profitable transactions.
     pub profitable_count: f64,
+    /// Paid transaction requests the exit rejected as unprofitable
+    /// (`nox_profitability_outcomes_total{result="UNPROFITABLE"}`), per request.
     pub unprofitable_count: f64,
     pub eth_pending: f64,
     pub eth_transactions_submitted: f64,

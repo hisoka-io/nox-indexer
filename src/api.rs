@@ -13,7 +13,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::broadcast::cluster_snapshot_json;
 use crate::node::offsets::network_totals;
-use crate::state::{AppState, CachedSeed, NodeState, NodeStatus, SyncPhase};
+use crate::state::{public_nodes, AppState, CachedSeed, NodeState, NodeStatus, SyncPhase};
 
 /// A pinned seed snapshot younger than this is served as is.
 pub(crate) const SEED_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -217,7 +217,7 @@ pub async fn handle_get_state(State(state): State<AppState>) -> impl IntoRespons
     let settlements = state.settlements.read().clone();
 
     axum::Json(json!({
-        "nodes": nodes,
+        "nodes": public_nodes(&nodes, &metrics),
         "metrics": metrics,
         "recent_events": events,
         "reputation": reputation,
@@ -620,9 +620,8 @@ fn assemble_seed_topology(
 async fn handle_ws_connection(mut socket: WebSocket, state: AppState) {
     let mut rx = state.tx.subscribe();
 
-    let nodes: Vec<NodeState> = state.nodes.read().values().cloned().collect();
     if socket
-        .send(Message::Text(cluster_snapshot_json(&nodes)))
+        .send(Message::Text(cluster_snapshot_json(&state)))
         .await
         .is_err()
     {
@@ -638,9 +637,8 @@ async fn handle_ws_connection(mut socket: WebSocket, state: AppState) {
             }
             Err(RecvError::Lagged(n)) => {
                 tracing::warn!("WebSocket client lagged by {n} messages, re-sending snapshot");
-                let nodes: Vec<NodeState> = state.nodes.read().values().cloned().collect();
                 if socket
-                    .send(Message::Text(cluster_snapshot_json(&nodes)))
+                    .send(Message::Text(cluster_snapshot_json(&state)))
                     .await
                     .is_err()
                 {
