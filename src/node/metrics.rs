@@ -62,9 +62,6 @@ pub struct StructuredMetrics {
     pub cumulative_cost_usd: f64,
     pub cumulative_maximum_cost_usd: f64,
     pub exit_payloads_dispatched: f64,
-    pub latency_p50: f64,
-    pub latency_p95: f64,
-    pub latency_p99: f64,
     pub build_version: String,
     /// Features the node reports about itself (`surb_v2`, `paid_v2`, `tunnel_v1`, ...).
     /// `None` when the body has no `capabilities` field (builds before rc.2) or
@@ -249,6 +246,19 @@ mod tests {
             assert_eq!(metrics.capabilities, None, "{body}");
             assert_eq!(metrics.packets_received, 2.0, "{body}");
         }
+    }
+
+    #[test]
+    fn latency_percentiles_are_not_republished() {
+        let metrics: StructuredMetrics = serde_json::from_str(
+            r#"{"latencyP50": 0, "latencyP95": 0, "latencyP99": 0, "packetsReceived": 3}"#,
+        )
+        .expect("rc.11 body with latency fields must decode");
+        let json = serde_json::to_value(&metrics).expect("metrics serialize");
+        for key in ["latencyP50", "latencyP95", "latencyP99"] {
+            assert!(json.get(key).is_none(), "{key}");
+        }
+        assert_eq!(json["packetsReceived"], 3.0);
     }
 
     #[test]

@@ -504,7 +504,7 @@ mod tests {
             packets_received: 500.0,
             active_peers: 9.0,
             mix_queue_depth: 3.0,
-            latency_p50: 43.0,
+            egress_queue_depth: 4.0,
             ..Default::default()
         });
         let current = StructuredMetrics {
@@ -512,7 +512,7 @@ mod tests {
             packets_received: 1.0,
             active_peers: 8.0,
             mix_queue_depth: 2.0,
-            latency_p50: 51.0,
+            egress_queue_depth: 1.0,
             ..Default::default()
         };
         s.observe(&current);
@@ -522,7 +522,7 @@ mod tests {
         // Instantaneous state passes through untouched.
         assert_eq!(live.active_peers, 8.0);
         assert_eq!(live.mix_queue_depth, 2.0);
-        assert_eq!(live.latency_p50, 51.0);
+        assert_eq!(live.egress_queue_depth, 1.0);
     }
 
     #[test]
