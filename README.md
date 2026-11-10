@@ -101,7 +101,7 @@ GET  /v1/state        nodes + metrics + events + reputation + network totals + s
 GET  /v1/reputation   uptime rankings (registered nodes only)
 GET  /seed/topology   chain-pinned SDK topology snapshot
 GET  /v1/settlements   paid execution totals, pool balances, recent settlements and claims (?limit=1..500)
-GET  /healthz         200 if db is up; body includes chain sync status
+GET  /healthz         200 if db is up; body includes chain sync status and the build's git `commit`
 GET  /healthz/sync    200 only if db is up and chain sync is live, verified and fresh (for uptime monitors)
 WS   /v1/live         pushes CLUSTER / METRICS / EVENT messages
 ```

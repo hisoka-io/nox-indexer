@@ -79,15 +79,52 @@ struct SeedTopologySnapshot {
     liveness: Vec<SeedLiveness>,
 }
 
+/// Build-time and run-time variable that carries the deployed git commit.
+/// Railway sets it in both places; the build-time value wins.
+const COMMIT_ENV: &str = "RAILWAY_GIT_COMMIT_SHA";
+const MAX_COMMIT_LEN: usize = 64;
+
+/// Git commit of this build, `None` when neither the build nor the
+/// environment provides one. Only ASCII hex digits are kept.
+fn build_commit() -> Option<&'static str> {
+    static COMMIT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    COMMIT
+        .get_or_init(|| {
+            option_env!("RAILWAY_GIT_COMMIT_SHA")
+                .and_then(clean_commit)
+                .or_else(|| {
+                    std::env::var(COMMIT_ENV)
+                        .ok()
+                        .and_then(|raw| clean_commit(&raw))
+                })
+        })
+        .as_deref()
+}
+
+fn clean_commit(raw: &str) -> Option<String> {
+    let commit = raw.trim();
+    (!commit.is_empty()
+        && commit.len() <= MAX_COMMIT_LEN
+        && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| commit.to_ascii_lowercase())
+}
+
 /// 200 whenever Postgres answers, so a slow or retrying chain sync never fails
-/// the platform healthcheck. Chain progress is reported in the body.
+/// the platform healthcheck. Chain progress and the build's git commit
+/// (`null` when unknown) are reported in the body.
 pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse {
     let chain = state.sync.read().clone();
     let sync_age_secs = chain.sync_age_secs(chrono::Utc::now().timestamp_millis());
+    let commit = build_commit();
     match state.db.ping().await {
         Ok(()) => (
             axum::http::StatusCode::OK,
-            axum::Json(json!({ "status": "ok", "sync_age_secs": sync_age_secs, "chain": chain })),
+            axum::Json(json!({
+                "status": "ok",
+                "commit": commit,
+                "sync_age_secs": sync_age_secs,
+                "chain": chain,
+            })),
         )
             .into_response(),
         Err(e) => {
@@ -97,6 +134,7 @@ pub async fn handle_healthz(State(state): State<AppState>) -> impl IntoResponse 
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(json!({
                     "status": "degraded",
+                    "commit": commit,
                     "error": "database unavailable",
                     "sync_age_secs": sync_age_secs,
                     "chain": chain,
@@ -655,6 +693,15 @@ async fn handle_ws_connection(mut socket: WebSocket, state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_is_kept_only_when_it_is_a_hex_sha() {
+        assert_eq!(clean_commit(" C3CF5279AB\n").as_deref(), Some("c3cf5279ab"));
+        assert_eq!(clean_commit(""), None);
+        assert_eq!(clean_commit("main"), None);
+        assert_eq!(clean_commit("c3cf527 && echo"), None);
+        assert_eq!(clean_commit(&"a".repeat(65)), None);
+    }
     use crate::chain::PinnedTopologyNode;
 
     fn cached_seed(version: u64, age: Duration) -> CachedSeed {

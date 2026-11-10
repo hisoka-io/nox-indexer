@@ -14,6 +14,8 @@ RUN rm -rf src
 # Copy actual source and migrations, then build
 COPY src/ src/
 COPY migrations/ migrations/
+# Railway passes the deployed commit as a build argument; /healthz reports it.
+ARG RAILWAY_GIT_COMMIT_SHA
 RUN touch src/main.rs && cargo build --release
 
 # Stage 2: Runtime
