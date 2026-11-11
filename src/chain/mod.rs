@@ -654,6 +654,9 @@ pub fn derive_admin_url_with(multiaddr: &str, allow_private: bool) -> String {
 }
 
 #[cfg(test)]
+mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

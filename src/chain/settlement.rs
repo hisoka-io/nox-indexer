@@ -87,7 +87,7 @@ impl SettlementConfig {
         }
     }
 
-    fn filter(&self) -> Filter {
+    pub(crate) fn filter(&self) -> Filter {
         let mut addresses = vec![self.entry_point];
         let mut topics = vec![Some(PaidExecutionSettledFilter::signature())];
         if let Some(pool) = self.reward_pool {
@@ -505,7 +505,7 @@ async fn refresh_summary(
     let mut pool_gauges = Vec::new();
     let mut pool_read_block = None;
     if let (Some(pool), Some(block)) = (config.reward_pool, read_block) {
-        match read_pool_gauges(state, chain, pool, block, &mut exits).await {
+        match read_pool_gauges(&state.shutdown, chain, pool, block, &mut exits).await {
             Ok(gauges) => {
                 pool_gauges = gauges;
                 pool_read_block = Some(block);
@@ -541,8 +541,8 @@ async fn read_view(
     .map(|value| value.to_string())
 }
 
-async fn read_pool_gauges(
-    state: &AppState,
+pub(crate) async fn read_pool_gauges(
+    shutdown: &tokio_util::sync::CancellationToken,
     chain: &ChainConfig,
     pool: Address,
     block: u64,
@@ -550,7 +550,6 @@ async fn read_pool_gauges(
 ) -> Result<Vec<PoolAssetGauge>, String> {
     let reader = NoxRewardPoolReader::new(pool, Arc::new(chain.provider.clone()));
     let at = BlockId::Number(BlockNumber::Number(block.into()));
-    let shutdown = &state.shutdown;
 
     for exit in exits.iter_mut() {
         let (Ok(exit_address), Ok(asset)) = (
