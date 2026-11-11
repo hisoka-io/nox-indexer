@@ -101,7 +101,7 @@ GET  /v1/state        nodes + metrics + events + reputation + network totals + s
 GET  /v1/reputation   uptime rankings (registered nodes only)
 GET  /seed/topology   chain-pinned SDK topology snapshot
 GET  /v1/settlements   paid execution totals, pool balances, recent settlements and claims (?limit=1..500)
-GET  /healthz         200 if db is up; body includes chain sync status
+GET  /healthz         200 if db is up; body includes chain sync status and the build's git `commit`
 GET  /healthz/sync    200 only if db is up and chain sync is live, verified and fresh (for uptime monitors)
 WS   /v1/live         pushes CLUSTER / METRICS / EVENT messages
 ```
@@ -119,7 +119,20 @@ WS   /v1/live         pushes CLUSTER / METRICS / EVENT messages
 | `settlements` | Settlement indexing summary: `enabled`, contract addresses, `last_block`, `executions`, per-exit `exits` (`executions`, `exit_fees`, `network_fees`, `claimed`, on-chain `claimable`), per-asset `pool` balances read at `pool_read_block` |
 
 Node `buildVersion` comes from the metrics JSON when present, otherwise from the node's
-`x-nox-version` response header.
+`x-nox-version` response header. Each object in `nodes` (and in the `/v1/live` CLUSTER message)
+also carries `version` (that build version) and `capabilities` (the node's reported list, such as
+`paid_v2`, `surb_v2`, `tunnel_v1`); both are `null` until the node has reported them. The node's
+metrics port and URL are internal scrape targets and are not published.
+
+Per-node `metrics` notes:
+
+| Field | Meaning |
+|-------|---------|
+| `uptimeSeconds` | Lifetime uptime across restarts, capped at the wall time since the indexer first saw the node (nodes indexed before that was stored count from `network_genesis_ms`). Self-reported by the node |
+| `profitableCount` | Paid transaction requests whose quote passed the exit's profitability check (`nox_profitability_outcomes_total{result="accepted"}`), counted per request. Not a count of settled or profitable transactions |
+| `unprofitableCount` | Paid transaction requests the exit rejected as unprofitable, counted per request |
+
+Latency percentiles join these fields once the node exporter derives them from its cover-loop round-trip histogram.
 
 Nodes carry `frozen`: a frozen node is still a registry member but must not be routed through.
 Each node's `role` comes from the registry and its `layer` is derived from that role (exits are

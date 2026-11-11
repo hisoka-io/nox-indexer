@@ -191,9 +191,16 @@ async fn init_state(
     let (tx, _rx) = tokio::sync::broadcast::channel(256);
 
     let metric_offsets = match db.load_metric_offsets().await {
-        Ok(offsets) => {
+        Ok(mut offsets) => {
             if !offsets.is_empty() {
                 tracing::info!("Loaded lifetime metric offsets for {} nodes", offsets.len());
+            }
+            // Rows from before first-seen was stored: the network's earliest
+            // evidence is the best bound the indexer has for them.
+            if let Some(genesis) = network_genesis_ms {
+                for offset in offsets.values_mut() {
+                    offset.backfill_first_seen(genesis);
+                }
             }
             offsets
         }

@@ -288,8 +288,9 @@ async fn apply_lifetime_offsets(state: &AppState, address: &str, parsed: &mut St
         let offset = map.entry(address.to_string()).or_default();
         // Observe the raw reading first; applying before observing would fold
         // previously banked totals back into last_raw and double-count them.
-        let seen = offset.observe(parsed, std::time::Instant::now());
-        offset.apply(parsed);
+        let wall_ms = now_ms();
+        let seen = offset.observe(parsed, std::time::Instant::now(), wall_ms);
+        offset.apply(parsed, wall_ms);
         if seen.adjusted && !offset.adjusting {
             tracing::warn!(
                 "Node {address} reported counters that went backwards or grew faster \
@@ -575,7 +576,14 @@ pub async fn uptime_check_loop(state: AppState, interval_secs: u64) {
             let interval_ms =
                 i64::try_from(interval_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
             match state.db.ensure_network_genesis(interval_ms).await {
-                Ok(genesis) => *state.network_genesis_ms.write() = genesis,
+                Ok(genesis) => {
+                    if let Some(genesis) = genesis {
+                        for offset in state.metric_offsets.write().values_mut() {
+                            offset.backfill_first_seen(genesis);
+                        }
+                    }
+                    *state.network_genesis_ms.write() = genesis;
+                }
                 Err(e) => tracing::warn!("Failed to record network genesis: {e}"),
             }
         }
@@ -783,7 +791,8 @@ mod tests {
         );
         assert!(state.metric_offsets.read()[NODE].adjusting);
 
-        let totals = crate::node::offsets::network_totals(state.metric_offsets.read().values());
+        let totals =
+            crate::node::offsets::network_totals(state.metric_offsets.read().values(), now_ms());
         assert_eq!(totals.packets_received, inflated.packets_received);
     }
 }

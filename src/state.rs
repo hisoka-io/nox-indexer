@@ -96,10 +96,14 @@ impl fmt::Display for NodeStatus {
 pub struct NodeState {
     pub id: String,
     pub address: String,
+    /// The node's metrics port and URL, which the indexer scrapes. Internal:
+    /// never part of the public projection.
+    #[serde(skip)]
     pub admin_port: u16,
     pub ingress_port: u16,
     pub p2p_addr: String,
     pub sphinx_key: String,
+    #[serde(skip)]
     pub admin_url: String,
     pub ingress_url: String,
     pub metadata_url: String,
@@ -115,6 +119,42 @@ pub struct NodeState {
     pub registry_address: String,
     #[serde(skip)]
     pub chain_id: u64,
+}
+
+/// A node as served by `/v1/state` and the `/v1/live` CLUSTER snapshot: its
+/// registry profile plus what it last reported about itself in `/metrics/json`.
+#[derive(Serialize, Debug)]
+pub struct PublicNode<'a> {
+    #[serde(flatten)]
+    pub node: &'a NodeState,
+    /// Build version the node reports; `null` until it has reported one.
+    pub version: Option<&'a str>,
+    /// Capabilities the node reports (`paid_v2`, `surb_v2`, `tunnel_v1`, ...);
+    /// `null` until it has reported a well-formed list.
+    pub capabilities: Option<&'a [String]>,
+}
+
+impl<'a> PublicNode<'a> {
+    pub fn new(node: &'a NodeState, metrics: Option<&'a StructuredMetrics>) -> Self {
+        Self {
+            node,
+            version: metrics
+                .map(|m| m.build_version.as_str())
+                .filter(|version| !version.is_empty()),
+            capabilities: metrics.and_then(|m| m.capabilities.as_deref()),
+        }
+    }
+}
+
+/// Public projections of `nodes`, joined with their latest metrics by address.
+pub fn public_nodes<'a>(
+    nodes: &'a [NodeState],
+    metrics: &'a HashMap<String, StructuredMetrics>,
+) -> Vec<PublicNode<'a>> {
+    nodes
+        .iter()
+        .map(|node| PublicNode::new(node, metrics.get(&node.address)))
+        .collect()
 }
 
 impl From<NodeRow> for NodeState {
@@ -479,6 +519,42 @@ mod tests {
             registry_address: "0xabc".to_string(),
             chain_id: 421_614,
         }
+    }
+
+    #[test]
+    fn public_nodes_carry_version_and_capabilities_but_no_admin_endpoint() {
+        let mut reported = row("0x1111111111111111111111111111111111111111", 2);
+        reported.admin_url = "http://203.0.113.7:15001".to_string();
+        let silent = row("0x2222222222222222222222222222222222222222", 1);
+        let nodes: Vec<NodeState> = vec![reported.into(), silent.into()];
+        let metrics: HashMap<String, StructuredMetrics> = [(
+            nodes[0].address.clone(),
+            StructuredMetrics {
+                build_version: "0.4.0-rc.11+676bb80".to_string(),
+                capabilities: Some(vec!["paid_v2".to_string(), "tunnel_v1".to_string()]),
+                ..Default::default()
+            },
+        )]
+        .into();
+
+        let json = serde_json::to_value(public_nodes(&nodes, &metrics)).unwrap();
+        assert_eq!(json[0]["version"], "0.4.0-rc.11+676bb80");
+        assert_eq!(
+            json[0]["capabilities"],
+            serde_json::json!(["paid_v2", "tunnel_v1"])
+        );
+        assert_eq!(json[0]["address"], nodes[0].address);
+        assert_eq!(json[0]["ingress_port"], 9002);
+        assert!(json[1]["version"].is_null());
+        assert!(json[1]["capabilities"].is_null());
+        for node in json.as_array().unwrap() {
+            let fields = node.as_object().unwrap();
+            assert!(!fields.contains_key("admin_url"), "{node}");
+            assert!(!fields.contains_key("admin_port"), "{node}");
+            assert!(!fields.contains_key("registry_address"), "{node}");
+        }
+        // The internal scrape target is kept.
+        assert_eq!(nodes[0].admin_url, "http://203.0.113.7:15001");
     }
 
     #[test]

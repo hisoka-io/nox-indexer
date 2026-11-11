@@ -1,22 +1,24 @@
 use serde_json::json;
 
 use crate::node::metrics::StructuredMetrics;
-use crate::state::{AppState, NodeState};
+use crate::state::{public_nodes, AppState, NodeState};
 
-pub fn cluster_snapshot_json(nodes: &[NodeState]) -> String {
+/// The CLUSTER message: every known node in its public projection.
+pub fn cluster_snapshot_json(state: &AppState) -> String {
+    let nodes: Vec<NodeState> = state.nodes.read().values().cloned().collect();
+    let metrics = state.metrics.read();
     json!({
         "type": "CLUSTER",
         "payload": {
             "node_count": nodes.len(),
-            "nodes": nodes
+            "nodes": public_nodes(&nodes, &metrics)
         }
     })
     .to_string()
 }
 
 pub fn broadcast_cluster_snapshot(state: &AppState) {
-    let nodes: Vec<NodeState> = state.nodes.read().values().cloned().collect();
-    send(state, cluster_snapshot_json(&nodes));
+    send(state, cluster_snapshot_json(state));
 }
 
 /// Fan a message out to WebSocket clients. A send error only means no client
