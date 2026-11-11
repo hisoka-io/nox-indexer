@@ -10,7 +10,7 @@ axum = { version = "0.7", features = ["ws", "macros"] }
 clap = { version = "4", features = ["derive", "env"] }
 ethers = { version = "2.0", default-features = false, features = ["abigen", "openssl"] }
 futures = "0.3"
-maxminddb = "0.24"
+maxminddb = "0.27"
 parking_lot = "0.12"
 chrono = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
