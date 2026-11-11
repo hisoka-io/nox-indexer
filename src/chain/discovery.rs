@@ -7,7 +7,7 @@
 //! new blocks. Failures are retried forever with backoff; a sync attempt never
 //! gives up into a silent "database only" mode.
 
-use ethers::prelude::*;
+use alloy::primitives::Address;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -670,8 +670,8 @@ mod tests {
 
     #[test]
     fn membership_replay_handles_every_removal_path() {
-        let a = Address::from_low_u64_be(1);
-        let b = Address::from_low_u64_be(2);
+        let a = Address::with_last_byte(1);
+        let b = Address::with_last_byte(2);
         let mut set = HashSet::new();
         assert!(apply_membership_event(
             &mut set,
@@ -689,7 +689,7 @@ mod tests {
             &mut set,
             &ChainNodeEvent::Unstaked {
                 address: b,
-                amount: U256::zero()
+                amount: alloy::primitives::U256::ZERO
             }
         ));
         assert!(apply_membership_event(

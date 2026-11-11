@@ -1,0 +1,928 @@
+{
+  "all_endpoints_fail": {
+    "output": {
+      "error": "Failed to get block number: all 2 RPC endpoint(s) failed for eth_blockNumber: [<endpoint 0>: (code: -32000, message: header not found, data: None)] [<endpoint 1>: (code: -32000, message: header not found, data: None)]",
+      "kind": "Transient",
+      "leaks_path": false,
+      "mixed_kind": "RangeTooLarge { hint: None }"
+    },
+    "requests": {
+      "first": [
+        {
+          "method": "eth_blockNumber",
+          "params": null
+        }
+      ],
+      "second": [
+        {
+          "method": "eth_blockNumber",
+          "params": null
+        }
+      ]
+    }
+  },
+  "block_timestamp": {
+    "output": {
+      "missing": {
+        "Err": "block 1 is not available yet"
+      },
+      "timestamp": {
+        "Ok": 1731260834
+      }
+    },
+    "requests": [
+      {
+        "method": "eth_getBlockByNumber",
+        "params": [
+          "0x12a05f20",
+          false
+        ]
+      },
+      {
+        "method": "eth_getBlockByNumber",
+        "params": [
+          "0x1",
+          false
+        ]
+      }
+    ]
+  },
+  "chain_id_and_head": {
+    "output": {
+      "chain_id": {
+        "Ok": 421614
+      },
+      "head": {
+        "Ok": 312500000
+      },
+      "safe_head": {
+        "Ok": 312499980
+      }
+    },
+    "requests": [
+      {
+        "method": "eth_chainId",
+        "params": null
+      },
+      {
+        "method": "eth_blockNumber",
+        "params": null
+      },
+      {
+        "method": "eth_blockNumber",
+        "params": null
+      }
+    ]
+  },
+  "encodings": {
+    "output": {
+      "fingerprint_check": {
+        "Ok": null
+      },
+      "registry_hex": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+      "relayers_calldata": [
+        "0x5300f8410000000000000000000000001efa385556a6e8643df0033048ba1dd67ec43f93",
+        "0x5300f8410000000000000000000000006dabb5682a62b3827ee7e0e02f1dace896ad457a",
+        "0x5300f84100000000000000000000000000000000000000000000000000000000000000dd"
+      ]
+    }
+  },
+  "membership": {
+    "output": {
+      "count": "3",
+      "fingerprint": "0x838aeaccfd5c01e7c0ea55e5e8155f262b5cebd6db2eb6cacaf659d02c56d3a7"
+    },
+    "requests": [
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0xcf1a7a21",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x3cce4d3d",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      }
+    ]
+  },
+  "node_info": {
+    "output": [
+      {
+        "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+        "frozen": false,
+        "ingress_url": "https://nox-a.example",
+        "metadata_url": "https://nox-a.example/meta",
+        "role": 3,
+        "sphinx_key": "abababababababababababababababababababababababababababababababab",
+        "url": "/ip4/203.0.113.10/tcp/15000/p2p/12D3KooWQreAexample"
+      },
+      {
+        "address": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+        "frozen": false,
+        "ingress_url": "https://nox-b.example",
+        "metadata_url": "",
+        "role": 1,
+        "sphinx_key": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "url": "/ip6/2001:db8::1/tcp/15000"
+      },
+      {
+        "address": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+        "frozen": true,
+        "ingress_url": "",
+        "metadata_url": "https://nox-c.example/meta",
+        "role": 2,
+        "sphinx_key": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f001",
+        "url": "/ip4/203.0.113.12/tcp/15000/p2p/12D3KooWC"
+      },
+      null
+    ],
+    "requests": [
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000001efa385556a6e8643df0033048ba1dd67ec43f93",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x55b211e30000000000000000000000001efa385556a6e8643df0033048ba1dd67ec43f93",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000006dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x55b211e30000000000000000000000006dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x55b211e30000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f84100000000000000000000000000000000000000000000000000000000000000dd",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "latest"
+        ]
+      }
+    ]
+  },
+  "pinned_topology": {
+    "output": {
+      "duplicate": {
+        "error": "replayed topology has duplicate address 0x1efa385556a6e8643df0033048ba1dd67ec43f93"
+      },
+      "full": {
+        "fingerprint": "838aeaccfd5c01e7c0ea55e5e8155f262b5cebd6db2eb6cacaf659d02c56d3a7",
+        "nodes": [
+          {
+            "address": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+            "frozen": true,
+            "ingress_url": "",
+            "is_privileged": false,
+            "layer": 2,
+            "metadata_url": "https://nox-c.example/meta",
+            "role": 2,
+            "sphinx_key": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f001",
+            "stake": "57896044618658097711785492504343953926634992332820282019728792003956564819973",
+            "url": "/ip4/203.0.113.12/tcp/15000/p2p/12D3KooWC"
+          },
+          {
+            "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+            "frozen": false,
+            "ingress_url": "https://nox-a.example",
+            "is_privileged": false,
+            "layer": 2,
+            "metadata_url": "https://nox-a.example/meta",
+            "role": 3,
+            "sphinx_key": "abababababababababababababababababababababababababababababababab",
+            "stake": "1000000000000000000",
+            "url": "/ip4/203.0.113.10/tcp/15000/p2p/12D3KooWQreAexample"
+          },
+          {
+            "address": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "frozen": false,
+            "ingress_url": "https://nox-b.example",
+            "is_privileged": true,
+            "layer": 1,
+            "metadata_url": "",
+            "role": 1,
+            "sphinx_key": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+            "stake": "0",
+            "url": "/ip6/2001:db8::1/tcp/15000"
+          }
+        ]
+      },
+      "partial": {
+        "error": "replayed topology count 2 differs from registry count 3"
+      },
+      "zero_block": {
+        "error": "seed topology requires a non-zero processed block"
+      }
+    },
+    "requests": [
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x3cce4d3d",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x55b211e30000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x55b211e30000000000000000000000001efa385556a6e8643df0033048ba1dd67ec43f93",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x55b211e30000000000000000000000006dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0xcf1a7a21",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000001efa385556a6e8643df0033048ba1dd67ec43f93",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000006dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "0x12a05f20"
+        ]
+      }
+    ],
+    "requests_rejected": [
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x3cce4d3d",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x3cce4d3d",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0xcf1a7a21",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0xcf1a7a21",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x02"
+          },
+          "0x12a05f20"
+        ]
+      }
+    ]
+  },
+  "pool_gauges": {
+    "output": {
+      "exits": [
+        {
+          "claimable": "7",
+          "claimed": "15",
+          "executions": 2,
+          "exit_address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+          "exit_fees": "40",
+          "fee_asset": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "network_fees": "2"
+        },
+        {
+          "claimable": "7",
+          "claimed": "0",
+          "executions": 1,
+          "exit_address": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+          "exit_fees": "4",
+          "fee_asset": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "network_fees": "1"
+        }
+      ],
+      "gauges": [
+        {
+          "asset": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "exit_outstanding": "15",
+          "network_outstanding": "25",
+          "total_collected": "100",
+          "total_distributed": "60"
+        }
+      ]
+    },
+    "requests": [
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x927dd7740000000000000000000000001efa385556a6e8643df0033048ba1dd67ec43f930000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0xa487baa4f2c3faa01c70066ee88b6f7fd6f1361d",
+            "type": "0x02"
+          },
+          "0x129f2d44"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x927dd7740000000000000000000000006dabb5682a62b3827ee7e0e02f1dace896ad457a0000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0xa487baa4f2c3faa01c70066ee88b6f7fd6f1361d",
+            "type": "0x02"
+          },
+          "0x129f2d44"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0xf3f053130000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0xa487baa4f2c3faa01c70066ee88b6f7fd6f1361d",
+            "type": "0x02"
+          },
+          "0x129f2d44"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x8b8dfa390000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0xa487baa4f2c3faa01c70066ee88b6f7fd6f1361d",
+            "type": "0x02"
+          },
+          "0x129f2d44"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0x2b72effb0000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0xa487baa4f2c3faa01c70066ee88b6f7fd6f1361d",
+            "type": "0x02"
+          },
+          "0x129f2d44"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "accessList": [],
+            "data": "0xa3dc5dd50000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0xa487baa4f2c3faa01c70066ee88b6f7fd6f1361d",
+            "type": "0x02"
+          },
+          "0x129f2d44"
+        ]
+      }
+    ]
+  },
+  "profiles": {
+    "output": [
+      {
+        "frozen": false,
+        "ingress_url": "https://nox-a.example",
+        "is_member": true,
+        "is_registered": true,
+        "layout": "Current9",
+        "metadata_url": "https://nox-a.example/meta",
+        "sphinx_key": "0xabababababababababababababababababababababababababababababababab",
+        "staked_amount": "1000000000000000000",
+        "status": 1,
+        "unstake_time": "0",
+        "url": "/ip4/203.0.113.10/tcp/15000/p2p/12D3KooWQreAexample"
+      },
+      {
+        "frozen": false,
+        "ingress_url": "https://nox-b.example",
+        "is_member": true,
+        "is_registered": true,
+        "layout": "Legacy7",
+        "metadata_url": "",
+        "sphinx_key": "0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "staked_amount": "0",
+        "status": null,
+        "unstake_time": "1730000000",
+        "url": "/ip6/2001:db8::1/tcp/15000"
+      },
+      {
+        "frozen": true,
+        "ingress_url": "",
+        "is_member": true,
+        "is_registered": true,
+        "layout": "Current9",
+        "metadata_url": "https://nox-c.example/meta",
+        "sphinx_key": "0xf0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f001",
+        "staked_amount": "57896044618658097711785492504343953926634992332820282019728792003956564819973",
+        "status": 2,
+        "unstake_time": "0",
+        "url": "/ip4/203.0.113.12/tcp/15000/p2p/12D3KooWC"
+      },
+      {
+        "frozen": false,
+        "ingress_url": "",
+        "is_member": false,
+        "is_registered": false,
+        "layout": "Current9",
+        "metadata_url": "",
+        "sphinx_key": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "staked_amount": "0",
+        "status": 0,
+        "unstake_time": "0",
+        "url": ""
+      }
+    ],
+    "requests": [
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000001efa385556a6e8643df0033048ba1dd67ec43f93",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "0x12a05f20"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000006dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f8410000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "0x1"
+        ]
+      },
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "data": "0x5300f84100000000000000000000000000000000000000000000000000000000000000dd",
+            "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "type": "0x00"
+          },
+          "latest"
+        ]
+      }
+    ]
+  },
+  "range_shrink": {
+    "output": {
+      "end": 1099,
+      "logs": 0,
+      "second_end": 1199
+    },
+    "requests": [
+      {
+        "method": "eth_getLogs",
+        "params": [
+          {
+            "address": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "fromBlock": "0x3e8",
+            "toBlock": "0x5dc",
+            "topics": []
+          }
+        ]
+      },
+      {
+        "method": "eth_getLogs",
+        "params": [
+          {
+            "address": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "fromBlock": "0x3e8",
+            "toBlock": "0x44b",
+            "topics": []
+          }
+        ]
+      },
+      {
+        "method": "eth_blockNumber",
+        "params": null
+      },
+      {
+        "method": "eth_getLogs",
+        "params": [
+          {
+            "address": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "fromBlock": "0x44c",
+            "toBlock": "0x4af",
+            "topics": []
+          }
+        ]
+      },
+      {
+        "method": "eth_blockNumber",
+        "params": null
+      }
+    ]
+  },
+  "rate_limited_failover": {
+    "output": {
+      "first": {
+        "Ok": 312500000
+      },
+      "second": {
+        "Ok": 312500000
+      }
+    },
+    "requests": {
+      "healthy": [
+        {
+          "method": "eth_blockNumber",
+          "params": null
+        },
+        {
+          "method": "eth_blockNumber",
+          "params": null
+        }
+      ],
+      "throttled": [
+        {
+          "method": "eth_blockNumber",
+          "params": null
+        }
+      ]
+    }
+  },
+  "registry_logs": {
+    "output": {
+      "count": 14,
+      "end": 312400500,
+      "events": [
+        {
+          "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+          "kind": "registered"
+        },
+        {
+          "address": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+          "kind": "registered"
+        },
+        {
+          "address": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "kind": "removed"
+        },
+        {
+          "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+          "kind": "profile_changed"
+        },
+        {
+          "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+          "kind": "profile_changed"
+        },
+        {
+          "address": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+          "kind": "profile_changed"
+        },
+        {
+          "address": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+          "kind": "profile_changed"
+        },
+        {
+          "address": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "kind": "profile_changed"
+        },
+        {
+          "address": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "kind": "profile_changed"
+        },
+        {
+          "address": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "kind": "profile_changed"
+        },
+        {
+          "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+          "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+          "kind": "unstaked"
+        },
+        null,
+        null,
+        null
+      ]
+    },
+    "requests": [
+      {
+        "method": "eth_getLogs",
+        "params": [
+          {
+            "address": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+            "fromBlock": "0x129ed880",
+            "toBlock": "0x129eda74",
+            "topics": []
+          }
+        ]
+      },
+      {
+        "method": "eth_blockNumber",
+        "params": null
+      }
+    ]
+  },
+  "revert_not_failed_over": {
+    "output": {
+      "is_err": true,
+      "kind": "Transient",
+      "mentions_revert": true
+    },
+    "requests": {
+      "healthy": [],
+      "reverting": [
+        {
+          "method": "eth_call",
+          "params": [
+            {
+              "data": "0x5300f8410000000000000000000000001efa385556a6e8643df0033048ba1dd67ec43f93",
+              "to": "0x8626af80db409bed3c19871fadf9b0ce7aa641bc",
+              "type": "0x00"
+            },
+            "latest"
+          ]
+        }
+      ]
+    }
+  },
+  "settlement_logs": {
+    "output": {
+      "end": 312421700,
+      "source_key": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e|0xa487baa4f2c3faa01c70066ee88b6f7fd6f1361d",
+      "source_key_without_pool": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+      "with_pool": [
+        {
+          "settled": {
+            "action_success": true,
+            "action_target": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "block_number": 312421615,
+            "block_timestamp": 0,
+            "execution_id": "0xa412c383d17399f82b23f035e4c32e5499e2745f064fd46c01801352d6adf2bf",
+            "exit_address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+            "exit_fee": "2142699799979998000",
+            "fee_asset": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+            "log_index": 15,
+            "network_fee": "107134989998999900",
+            "payment_id": "0x28fe69284e8b20a101fb71984bee0ef8296126e224e6a70a22caee05f355f7eb",
+            "tx_hash": "0x8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f"
+          }
+        },
+        {
+          "claimed": {
+            "amount": "5",
+            "asset": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+            "block_number": 312421616,
+            "block_timestamp": 0,
+            "exit_address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+            "log_index": 16,
+            "recipient": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "tx_hash": "0x9090909090909090909090909090909090909090909090909090909090909090"
+          }
+        },
+        null,
+        null,
+        null
+      ],
+      "without_pool": [
+        {
+          "settled": {
+            "action_success": true,
+            "action_target": "0x6dabb5682a62b3827ee7e0e02f1dace896ad457a",
+            "block_number": 312421615,
+            "block_timestamp": 0,
+            "execution_id": "0xa412c383d17399f82b23f035e4c32e5499e2745f064fd46c01801352d6adf2bf",
+            "exit_address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+            "exit_fee": "2142699799979998000",
+            "fee_asset": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+            "log_index": 15,
+            "network_fee": "107134989998999900",
+            "payment_id": "0x28fe69284e8b20a101fb71984bee0ef8296126e224e6a70a22caee05f355f7eb",
+            "tx_hash": "0x8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f"
+          }
+        },
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    "requests": [
+      {
+        "method": "eth_getLogs",
+        "params": [
+          {
+            "address": [
+              "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+              "0xa487baa4f2c3faa01c70066ee88b6f7fd6f1361d"
+            ],
+            "fromBlock": "0x129f2a88",
+            "toBlock": "0x129f2d44",
+            "topics": [
+              [
+                "0x08999181408049964f922b10eccdf5d39b08dcb8920aac22cd2fc19282d63012",
+                "0x92e0ae99e3f3d04ceee88f4f453b6bffbdfc7625523b73eea93710adab80d4ca"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "method": "eth_blockNumber",
+        "params": null
+      }
+    ],
+    "requests_without_pool": [
+      {
+        "method": "eth_getLogs",
+        "params": [
+          {
+            "address": [
+              "0xad911ca217c6dc779fce6a6538bdda3071c38e7e"
+            ],
+            "fromBlock": "0x129f2a88",
+            "toBlock": "0x129f2a88",
+            "topics": [
+              [
+                "0x08999181408049964f922b10eccdf5d39b08dcb8920aac22cd2fc19282d63012"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "method": "eth_blockNumber",
+        "params": null
+      }
+    ]
+  }
+}

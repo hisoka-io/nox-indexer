@@ -9,7 +9,7 @@ use crate::chain::settlement::{
 };
 use crate::node::offsets::{CumulativeMetrics, NodeOffset};
 use crate::state::{NodeState, NodeStatus};
-use ethers::types::Address;
+use alloy::primitives::Address;
 
 const EMA_ALPHA: f64 = 0.01;
 

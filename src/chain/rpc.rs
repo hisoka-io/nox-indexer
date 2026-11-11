@@ -10,31 +10,30 @@
 //! the host.
 
 use std::fmt;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use ethers::providers::{
-    Http, HttpClientError, JsonRpcClient, JsonRpcError, ProviderError, RpcError,
-};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use alloy::rpc::client::RpcClient;
+use alloy::rpc::json_rpc::{ErrorPayload, RequestPacket, ResponsePacket};
+use alloy::transports::{TransportError, TransportErrorKind, TransportFut};
+use serde::Deserialize;
 
-/// Upper bound for one request against one endpoint. ethers' HTTP transport has
-/// no timeout of its own, so a hung endpoint would otherwise stall the sync.
+/// Upper bound for one request against one endpoint. The HTTP client has no
+/// timeout of its own, so a hung endpoint would otherwise stall the sync.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Endpoint {
-    http: Http,
+    url: reqwest::Url,
     label: String,
     secrets: Vec<String>,
 }
 
-/// JSON-RPC client over an ordered list of HTTP endpoints.
+/// JSON-RPC transport over an ordered list of HTTP endpoints.
 #[derive(Clone)]
 pub struct FailoverHttp {
+    client: reqwest::Client,
     endpoints: Arc<Vec<Endpoint>>,
     preferred: Arc<AtomicUsize>,
     /// Index of the endpoint that served the most recent `eth_getLogs`.
@@ -72,6 +71,34 @@ pub fn redact_url(raw: &str) -> String {
     }
 }
 
+/// One endpoint's answer to one request.
+enum Attempt {
+    /// A JSON-RPC response that is not an error object.
+    Answered(ResponsePacket),
+    /// A JSON-RPC error object, as `(code: .., message: .., data: ..)`.
+    Rejected { text: String, deterministic: bool },
+    /// Transport, HTTP or decoding failure.
+    Failed(String),
+}
+
+/// JSON-RPC error text in the form the logs and the error classifier use.
+fn error_text(error: &ErrorPayload) -> String {
+    let data = match &error.data {
+        Some(data) => format!("Some({})", data.get()),
+        None => "None".to_string(),
+    };
+    format!(
+        "(code: {}, message: {}, data: {data})",
+        error.code, error.message
+    )
+}
+
+/// Errors that every endpoint would reproduce, so failing over is pointless.
+fn is_deterministic(error: &ErrorPayload) -> bool {
+    let message = error.message.to_lowercase();
+    error.code == 3 || message.contains("execution reverted") || message.contains("revert")
+}
+
 impl FailoverHttp {
     pub fn new(urls: &[String]) -> Result<Self, String> {
         if urls.is_empty() {
@@ -80,26 +107,32 @@ impl FailoverHttp {
         let endpoints = urls
             .iter()
             .map(|raw| {
-                let http = Http::from_str(raw)
+                let url = reqwest::Url::parse(raw)
                     .map_err(|e| format!("Invalid RPC URL '{}': {e}", redact_url(raw)))?;
-                let normalized = http.url().to_string();
+                let normalized = url.to_string();
                 let label = redact_url(raw);
                 // Longest first so a full URL is replaced before its prefix.
                 let mut secrets = vec![normalized, raw.to_string()];
                 secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
                 secrets.dedup();
                 Ok(Endpoint {
-                    http,
+                    url,
                     label,
                     secrets,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
+            client: reqwest::Client::new(),
             endpoints: Arc::new(endpoints),
             preferred: Arc::new(AtomicUsize::new(0)),
             logs_served_by: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// JSON-RPC client that sends every request through this transport.
+    pub fn rpc_client(&self) -> RpcClient {
+        RpcClient::new(self.clone(), false)
     }
 
     /// The endpoint that served the most recent `eth_getLogs`. Only one task
@@ -116,24 +149,32 @@ impl FailoverHttp {
 
     /// `eth_blockNumber` on one specific endpoint, bypassing failover.
     pub async fn block_number_on(&self, index: usize) -> Result<u64, String> {
+        #[derive(Deserialize)]
+        struct BlockNumber {
+            result: alloy::primitives::U64,
+        }
+
         let endpoint = self
             .endpoints
             .get(index)
             .ok_or_else(|| format!("no RPC endpoint #{index}"))?;
-        let outcome = tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            endpoint
-                .http
-                .request::<_, ethers::types::U64>("eth_blockNumber", ()),
-        )
-        .await;
-        match outcome {
-            Ok(Ok(block)) => Ok(block.as_u64()),
-            Ok(Err(error)) => Err(format!(
+        let body = br#"{"jsonrpc":"2.0","id":0,"method":"eth_blockNumber"}"#.to_vec();
+        let outcome = tokio::time::timeout(REQUEST_TIMEOUT, self.post(endpoint, body)).await;
+        let failed = |error: String| {
+            format!(
                 "{}: eth_blockNumber failed: {}",
                 endpoint.label,
-                self.redact(&error.to_string())
-            )),
+                self.redact(&error)
+            )
+        };
+        match outcome {
+            Ok(Ok(body)) => match serde_json::from_slice::<ErrorReply>(&body) {
+                Ok(ErrorReply { error: Some(error) }) => Err(failed(error_text(&error))),
+                _ => serde_json::from_slice::<BlockNumber>(&body)
+                    .map(|reply| reply.result.to::<u64>())
+                    .map_err(|error| failed(deserialization_text(&error, &body))),
+            },
+            Ok(Err(error)) => Err(failed(error)),
             Err(_) => Err(format!(
                 "{}: eth_blockNumber timed out after {}s",
                 endpoint.label,
@@ -171,76 +212,60 @@ impl FailoverHttp {
         }
         out
     }
-}
 
-/// Errors that every endpoint would reproduce, so failing over is pointless.
-fn is_deterministic(error: &HttpClientError) -> bool {
-    match error {
-        HttpClientError::JsonRpcError(rpc) => {
-            let message = rpc.message.to_lowercase();
-            rpc.code == 3 || message.contains("execution reverted") || message.contains("revert")
+    /// POST one JSON body. The reply body is returned whatever the HTTP status,
+    /// so a JSON-RPC error object on a 4xx/5xx reply is still read as one.
+    async fn post(&self, endpoint: &Endpoint, body: Vec<u8>) -> Result<Vec<u8>, String> {
+        let response = self
+            .client
+            .post(endpoint.url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn attempt(&self, endpoint: &Endpoint, body: Vec<u8>) -> Attempt {
+        let body = match self.post(endpoint, body).await {
+            Ok(body) => body,
+            Err(error) => return Attempt::Failed(error),
+        };
+        let packet = match serde_json::from_slice::<ResponsePacket>(&body) {
+            Ok(packet) => packet,
+            Err(error) => return Attempt::Failed(deserialization_text(&error, &body)),
+        };
+        match &packet {
+            ResponsePacket::Single(response) => match response.payload.as_error() {
+                Some(error) => Attempt::Rejected {
+                    text: error_text(error),
+                    deterministic: is_deterministic(error),
+                },
+                None => Attempt::Answered(packet),
+            },
+            // Batches are never sent by the indexer; each entry carries its own
+            // result or error, so only transport failures fail over.
+            ResponsePacket::Batch(_) => Attempt::Answered(packet),
         }
-        _ => false,
-    }
-}
-
-/// Error surfaced once every endpoint failed (or one failed deterministically).
-#[derive(Debug)]
-pub struct FailoverError {
-    summary: String,
-    last: Option<HttpClientError>,
-}
-
-impl fmt::Display for FailoverError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.summary)
-    }
-}
-
-impl std::error::Error for FailoverError {}
-
-impl RpcError for FailoverError {
-    fn as_error_response(&self) -> Option<&JsonRpcError> {
-        self.last.as_ref().and_then(RpcError::as_error_response)
     }
 
-    fn as_serde_error(&self) -> Option<&serde_json::Error> {
-        self.last.as_ref().and_then(RpcError::as_serde_error)
-    }
-}
-
-impl From<FailoverError> for ProviderError {
-    fn from(error: FailoverError) -> Self {
-        ProviderError::JsonRpcClientError(Box::new(error))
-    }
-}
-
-#[async_trait]
-impl JsonRpcClient for FailoverHttp {
-    type Error = FailoverError;
-
-    async fn request<T, R>(&self, method: &str, params: T) -> Result<R, Self::Error>
-    where
-        T: fmt::Debug + Serialize + Send + Sync,
-        R: DeserializeOwned + Send,
-    {
-        let params = serde_json::to_value(&params).map_err(|e| FailoverError {
-            summary: format!("failed to serialize {method} params: {e}"),
-            last: None,
-        })?;
+    async fn send(self, request: RequestPacket) -> Result<ResponsePacket, TransportError> {
+        let method = request.method_names().next().unwrap_or("?").to_string();
+        let body = serde_json::to_vec(&request).map_err(TransportError::ser_err)?;
 
         let count = self.endpoints.len();
         let start = self.preferred.load(Ordering::Relaxed) % count;
         let mut failures = Vec::with_capacity(count);
-        let mut last = None;
 
         for offset in 0..count {
             let index = (start + offset) % count;
             let endpoint = &self.endpoints[index];
             let outcome =
-                tokio::time::timeout(REQUEST_TIMEOUT, endpoint.http.request(method, &params)).await;
-            match outcome {
-                Ok(Ok(value)) => {
+                tokio::time::timeout(REQUEST_TIMEOUT, self.attempt(endpoint, body.clone())).await;
+            let text = match outcome {
+                Ok(Attempt::Answered(packet)) => {
                     if method == "eth_getLogs" {
                         self.logs_served_by.store(index, Ordering::Relaxed);
                     }
@@ -253,39 +278,57 @@ impl JsonRpcClient for FailoverHttp {
                             failures.join(" ")
                         );
                     }
-                    return Ok(value);
+                    return Ok(packet);
                 }
-                Ok(Err(error)) => {
-                    let text = self.redact(&error.to_string());
-                    if is_deterministic(&error) {
-                        return Err(FailoverError {
-                            summary: format!("{}: {text}", endpoint.label),
-                            last: Some(error),
-                        });
-                    }
-                    failures.push(format!("[{}: {text}]", endpoint.label));
-                    last = Some(error);
-                }
-                Err(_) => {
-                    failures.push(format!(
-                        "[{}: timed out after {}s]",
+                Ok(Attempt::Rejected {
+                    text,
+                    deterministic: true,
+                }) => {
+                    return Err(TransportErrorKind::custom_str(&format!(
+                        "{}: {}",
                         endpoint.label,
-                        REQUEST_TIMEOUT.as_secs()
-                    ));
+                        self.redact(&text)
+                    )));
                 }
-            }
+                Ok(Attempt::Rejected { text, .. } | Attempt::Failed(text)) => self.redact(&text),
+                Err(_) => format!("timed out after {}s", REQUEST_TIMEOUT.as_secs()),
+            };
+            failures.push(format!("[{}: {text}]", endpoint.label));
         }
 
         // Every endpoint failed: start the next request on the following one so a
         // persistently broken primary does not absorb the first attempt forever.
         self.preferred.store((start + 1) % count, Ordering::Relaxed);
-        Err(FailoverError {
-            summary: format!(
-                "all {count} RPC endpoint(s) failed for {method}: {}",
-                failures.join(" ")
-            ),
-            last,
-        })
+        Err(TransportErrorKind::custom_str(&format!(
+            "all {count} RPC endpoint(s) failed for {method}: {}",
+            failures.join(" ")
+        )))
+    }
+}
+
+#[derive(Deserialize)]
+struct ErrorReply {
+    error: Option<ErrorPayload>,
+}
+
+fn deserialization_text(error: &serde_json::Error, body: &[u8]) -> String {
+    format!(
+        "Deserialization Error: {error}. Response: {}",
+        String::from_utf8_lossy(body)
+    )
+}
+
+impl tower::Service<RequestPacket> for FailoverHttp {
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: RequestPacket) -> Self::Future {
+        Box::pin(self.clone().send(request))
     }
 }
 
@@ -328,18 +371,17 @@ mod tests {
 
     #[test]
     fn reverts_are_not_failed_over() {
-        let revert = HttpClientError::JsonRpcError(JsonRpcError {
-            code: 3,
-            message: "execution reverted".to_string(),
+        let payload = |code: i64, message: &'static str| ErrorPayload {
+            code,
+            message: message.into(),
             data: None,
-        });
-        let rate_limit = HttpClientError::JsonRpcError(JsonRpcError {
-            code: 429,
-            message: "Too Many Requests".to_string(),
-            data: None,
-        });
-        assert!(is_deterministic(&revert));
-        assert!(!is_deterministic(&rate_limit));
+        };
+        assert!(is_deterministic(&payload(3, "execution reverted")));
+        assert!(!is_deterministic(&payload(429, "Too Many Requests")));
+        assert_eq!(
+            error_text(&payload(-32000, "header not found")),
+            "(code: -32000, message: header not found, data: None)"
+        );
     }
 
     #[tokio::test]
@@ -373,12 +415,13 @@ mod tests {
         let healthy = serve(r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#).await;
         let client = FailoverHttp::new(&[limited, healthy]).unwrap();
 
-        let block: ethers::types::U64 = client.request("eth_blockNumber", ()).await.unwrap();
-        assert_eq!(block.as_u64(), 42);
+        let rpc = client.rpc_client();
+        let block: alloy::primitives::U64 = rpc.request_noparams("eth_blockNumber").await.unwrap();
+        assert_eq!(block.to::<u64>(), 42);
         assert_eq!(client.preferred.load(Ordering::Relaxed), 1);
 
-        let again: ethers::types::U64 = client.request("eth_blockNumber", ()).await.unwrap();
-        assert_eq!(again.as_u64(), 42);
+        let again: alloy::primitives::U64 = rpc.request_noparams("eth_blockNumber").await.unwrap();
+        assert_eq!(again.to::<u64>(), 42);
     }
 
     #[tokio::test]
@@ -389,7 +432,8 @@ mod tests {
         ])
         .unwrap();
         let error = client
-            .request::<_, ethers::types::U64>("eth_blockNumber", ())
+            .rpc_client()
+            .request_noparams::<alloy::primitives::U64>("eth_blockNumber")
             .await
             .expect_err("closed ports must fail");
         let text = error.to_string();

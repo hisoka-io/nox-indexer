@@ -6,15 +6,15 @@ pub mod settlement;
 
 pub use discovery::run_chain_sync;
 
-use ethers::prelude::*;
-use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::utils::keccak256;
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256, U64};
+use alloy::rpc::client::RpcClient;
+use alloy::sol;
+use alloy::sol_types::{SolCall, SolEvent};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -23,27 +23,24 @@ use profile::{decode_relayer_profile, relayers_calldata, RelayerProfile};
 use retry::{classify_rpc_error, jittered_backoff, AdaptiveChunk, RpcErrorKind};
 use rpc::FailoverHttp;
 
-abigen!(
-    NoxRegistryContract,
-    r#"[
-        event RelayerRegistered(address indexed relayer, bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stake, uint8 nodeRole)
-        event PrivilegedRelayerRegistered(address indexed relayer, bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint8 nodeRole)
-        event RelayerRemoved(address indexed relayer, address indexed by)
-        event RelayerUpdated(address indexed relayer, string newUrl)
-        event IngressUrlUpdated(address indexed relayer, string newIngressUrl)
-        event MetadataUrlUpdated(address indexed relayer, string newMetadataUrl)
-        event KeyRotated(address indexed relayer, bytes32 newSphinxKey)
-        event RoleUpdated(address indexed relayer, uint8 newRole)
-        event RelayerFrozen(address indexed relayer, address indexed by)
-        event RelayerUnfrozen(address indexed relayer, address indexed by)
-        event Unstaked(address indexed relayer, uint256 amount)
-        function relayerCount() view returns (uint256)
-        function topologyFingerprint() view returns (bytes32)
-        function getNodeRole(address _relayer) view returns (uint8)
-    ]"#
-);
-
-pub type RegistryProvider = Provider<FailoverHttp>;
+sol! {
+    interface NoxRegistry {
+        event RelayerRegistered(address indexed relayer, bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stake, uint8 nodeRole);
+        event PrivilegedRelayerRegistered(address indexed relayer, bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint8 nodeRole);
+        event RelayerRemoved(address indexed relayer, address indexed by);
+        event RelayerUpdated(address indexed relayer, string newUrl);
+        event IngressUrlUpdated(address indexed relayer, string newIngressUrl);
+        event MetadataUrlUpdated(address indexed relayer, string newMetadataUrl);
+        event KeyRotated(address indexed relayer, bytes32 newSphinxKey);
+        event RoleUpdated(address indexed relayer, uint8 newRole);
+        event RelayerFrozen(address indexed relayer, address indexed by);
+        event RelayerUnfrozen(address indexed relayer, address indexed by);
+        event Unstaked(address indexed relayer, uint256 amount);
+        function relayerCount() external view returns (uint256);
+        function topologyFingerprint() external view returns (bytes32);
+        function getNodeRole(address _relayer) external view returns (uint8);
+    }
+}
 
 /// Attempts per `eth_getLogs` chunk before the error is handed to the caller
 /// (whose own loop keeps its progress and retries with a longer backoff).
@@ -61,6 +58,111 @@ const PROFILE_READ_CONCURRENCY: usize = 4;
 /// checkpoint past events it never returned.
 const HEAD_CHECK_WINDOW: u64 = 100_000;
 
+/// One `eth_getLogs` entry, with the fields the indexer reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Log {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Bytes,
+    #[serde(default)]
+    pub block_number: Option<U64>,
+    #[serde(default)]
+    pub transaction_hash: Option<B256>,
+    #[serde(default)]
+    pub log_index: Option<U64>,
+    /// `true` when a reorg dropped the log.
+    #[serde(default)]
+    pub removed: Option<bool>,
+}
+
+/// `eth_getLogs` address and `topic0` selection; the block range is set per
+/// request. Serialized as the indexer has always sent it: one address as a
+/// string, several as an array, and `topics` empty or `[[topic0, ...]]`.
+#[derive(Debug, Clone)]
+pub struct LogFilter {
+    addresses: LogAddresses,
+    topic0: Option<Vec<B256>>,
+}
+
+#[derive(Debug, Clone)]
+enum LogAddresses {
+    One(Address),
+    Many(Vec<Address>),
+}
+
+impl LogFilter {
+    /// Every log of one contract.
+    pub fn contract(address: Address) -> Self {
+        Self {
+            addresses: LogAddresses::One(address),
+            topic0: None,
+        }
+    }
+
+    /// Logs of any of `addresses` whose first topic is one of `topic0`.
+    pub fn events(addresses: Vec<Address>, topic0: Vec<B256>) -> Self {
+        Self {
+            addresses: LogAddresses::Many(addresses),
+            topic0: Some(topic0),
+        }
+    }
+
+    fn params(&self, from: u64, to: u64) -> serde_json::Value {
+        let address = match &self.addresses {
+            LogAddresses::One(address) => serde_json::json!(format!("{address:?}")),
+            LogAddresses::Many(addresses) => serde_json::json!(addresses
+                .iter()
+                .map(|address| format!("{address:?}"))
+                .collect::<Vec<_>>()),
+        };
+        let topics = match &self.topic0 {
+            None => serde_json::json!([]),
+            Some(topics) => serde_json::json!([topics
+                .iter()
+                .map(|topic| format!("{topic:?}"))
+                .collect::<Vec<_>>()]),
+        };
+        serde_json::json!({
+            "address": address,
+            "fromBlock": format!("{from:#x}"),
+            "toBlock": format!("{to:#x}"),
+            "topics": topics,
+        })
+    }
+}
+
+/// Block parameter of a read: a hex quantity, or `latest`.
+fn block_tag(block: Option<u64>) -> String {
+    block.map_or_else(|| "latest".to_string(), |n| format!("{n:#x}"))
+}
+
+/// The call object of a contract view, in the EIP-1559 form contract views
+/// have always been sent in (`type` 0x02 with an empty access list).
+fn view_object(to: Address, data: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "0x02",
+        "to": format!("{to:?}"),
+        "data": format!("0x{}", alloy::hex::encode(data)),
+        "accessList": [],
+    })
+}
+
+/// The call object of a raw `relayers(address)` read (legacy `type` 0x00).
+fn legacy_call_object(to: Address, data: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "0x00",
+        "to": format!("{to:?}"),
+        "data": format!("0x{}", alloy::hex::encode(data)),
+    })
+}
+
+/// The only field of `eth_getBlockByNumber` the indexer reads.
+#[derive(Debug, serde::Deserialize)]
+struct BlockTimestamp {
+    timestamp: U64,
+}
+
 /// `eth_getLogs` range tuning.
 #[derive(Debug, Clone, Copy)]
 pub struct LogChunkConfig {
@@ -70,11 +172,11 @@ pub struct LogChunkConfig {
 }
 
 pub struct ChainConfig {
-    pub provider: RegistryProvider,
+    pub client: RpcClient,
+    pub transport: FailoverHttp,
     pub registry_address: Address,
     /// Lowercase 0x-prefixed registry address, the key used in Postgres.
     pub registry_hex: String,
-    pub contract: NoxRegistryContract<RegistryProvider>,
     pub poll_interval: Duration,
     /// Contract deployment block: the start of a full replay.
     pub from_block: u64,
@@ -201,19 +303,17 @@ impl ChainConfig {
     ) -> Result<Self, String> {
         let transport = FailoverHttp::new(rpc_urls)?;
         let endpoint_labels = transport.labels();
-        let provider = Provider::new(transport);
+        let client = transport.rpc_client();
 
         let registry_address = registry_hex
             .parse::<Address>()
             .map_err(|e| format!("Invalid registry address '{registry_hex}': {e}"))?;
 
-        let contract = NoxRegistryContract::new(registry_address, Arc::new(provider.clone()));
-
         Ok(Self {
-            provider,
+            client,
+            transport,
             registry_address,
             registry_hex: format!("{registry_address:?}").to_lowercase(),
-            contract,
             poll_interval: Duration::from_secs(poll_secs),
             from_block,
             confirmations,
@@ -231,11 +331,11 @@ impl ChainConfig {
             return Ok(cached);
         }
         let id = self
-            .provider
-            .get_chainid()
+            .client
+            .request_noparams::<U64>("eth_chainId")
             .await
             .map_err(|e| format!("Failed to get chain id: {e}"))?
-            .as_u64();
+            .to::<u64>();
         if let Some(expected) = self.expected_chain_id {
             if expected != id {
                 return Err(format!(
@@ -264,7 +364,7 @@ impl ChainConfig {
         to: u64,
         shutdown: &CancellationToken,
     ) -> Result<(Vec<Log>, u64), String> {
-        let base = Filter::new().address(self.registry_address);
+        let base = LogFilter::contract(self.registry_address);
         self.fetch_filtered_logs_chunk(&base, from, to, shutdown)
             .await
     }
@@ -274,7 +374,7 @@ impl ChainConfig {
     /// provider's limits rather than the contract.
     pub async fn fetch_filtered_logs_chunk(
         &self,
-        base: &Filter,
+        base: &LogFilter,
         from: u64,
         to: u64,
         shutdown: &CancellationToken,
@@ -284,9 +384,10 @@ impl ChainConfig {
             let span = self.chunk.lock().size();
             let end = from.saturating_add(span.saturating_sub(1)).min(to);
             let requested = end - from + 1;
-            let filter = base.clone().from_block(from).to_block(end);
+            let filter = base.params(from, end);
 
-            let error = match self.provider.get_logs(&filter).await {
+            let result: Result<Vec<Log>, _> = self.client.request("eth_getLogs", [filter]).await;
+            let error = match result {
                 Ok(logs) => match self.check_logs_endpoint_head(end, to).await {
                     Ok(()) => {
                         self.chunk.lock().on_success();
@@ -340,7 +441,7 @@ impl ChainConfig {
         if to.saturating_sub(end) >= HEAD_CHECK_WINDOW {
             return Ok(());
         }
-        let transport = self.provider.as_ref();
+        let transport = &self.transport;
         let index = transport.logs_served_by();
         let head = transport.block_number_on(index).await?;
         if head >= end {
@@ -358,67 +459,69 @@ impl ChainConfig {
         if log.address != self.registry_address {
             return None;
         }
+        let topics = &log.topics;
+        let data = &log.data;
         macro_rules! try_decode {
-            ($filter:ty, $name:expr, $map:expr) => {
-                if let Ok(e) = self.contract.decode_event::<$filter>(
-                    $name,
-                    log.topics.clone(),
-                    log.data.clone(),
-                ) {
+            ($event:ty, $map:expr) => {
+                if let Ok(e) = <$event>::decode_raw_log(topics.iter().copied(), data) {
                     return Some($map(e));
                 }
             };
         }
 
         try_decode!(
-            RelayerRegisteredFilter,
-            "RelayerRegistered",
-            |e: RelayerRegisteredFilter| ChainNodeEvent::Registered { address: e.relayer }
+            NoxRegistry::RelayerRegistered,
+            |e: NoxRegistry::RelayerRegistered| {
+                ChainNodeEvent::Registered { address: e.relayer }
+            }
         );
         try_decode!(
-            PrivilegedRelayerRegisteredFilter,
-            "PrivilegedRelayerRegistered",
-            |e: PrivilegedRelayerRegisteredFilter| ChainNodeEvent::Registered {
+            NoxRegistry::PrivilegedRelayerRegistered,
+            |e: NoxRegistry::PrivilegedRelayerRegistered| ChainNodeEvent::Registered {
                 address: e.relayer
             }
         );
         try_decode!(
-            RelayerRemovedFilter,
-            "RelayerRemoved",
-            |e: RelayerRemovedFilter| ChainNodeEvent::Removed { address: e.relayer }
+            NoxRegistry::RelayerRemoved,
+            |e: NoxRegistry::RelayerRemoved| { ChainNodeEvent::Removed { address: e.relayer } }
         );
         try_decode!(
-            RelayerUpdatedFilter,
-            "RelayerUpdated",
-            |e: RelayerUpdatedFilter| { ChainNodeEvent::ProfileChanged { address: e.relayer } }
+            NoxRegistry::RelayerUpdated,
+            |e: NoxRegistry::RelayerUpdated| {
+                ChainNodeEvent::ProfileChanged { address: e.relayer }
+            }
         );
         try_decode!(
-            IngressUrlUpdatedFilter,
-            "IngressUrlUpdated",
-            |e: IngressUrlUpdatedFilter| ChainNodeEvent::ProfileChanged { address: e.relayer }
+            NoxRegistry::IngressUrlUpdated,
+            |e: NoxRegistry::IngressUrlUpdated| {
+                ChainNodeEvent::ProfileChanged { address: e.relayer }
+            }
         );
         try_decode!(
-            MetadataUrlUpdatedFilter,
-            "MetadataUrlUpdated",
-            |e: MetadataUrlUpdatedFilter| ChainNodeEvent::ProfileChanged { address: e.relayer }
+            NoxRegistry::MetadataUrlUpdated,
+            |e: NoxRegistry::MetadataUrlUpdated| {
+                ChainNodeEvent::ProfileChanged { address: e.relayer }
+            }
         );
-        try_decode!(KeyRotatedFilter, "KeyRotated", |e: KeyRotatedFilter| {
+        try_decode!(NoxRegistry::KeyRotated, |e: NoxRegistry::KeyRotated| {
             ChainNodeEvent::ProfileChanged { address: e.relayer }
         });
-        try_decode!(RoleUpdatedFilter, "RoleUpdated", |e: RoleUpdatedFilter| {
+        try_decode!(NoxRegistry::RoleUpdated, |e: NoxRegistry::RoleUpdated| {
             ChainNodeEvent::ProfileChanged { address: e.relayer }
         });
         try_decode!(
-            RelayerFrozenFilter,
-            "RelayerFrozen",
-            |e: RelayerFrozenFilter| { ChainNodeEvent::ProfileChanged { address: e.relayer } }
+            NoxRegistry::RelayerFrozen,
+            |e: NoxRegistry::RelayerFrozen| {
+                ChainNodeEvent::ProfileChanged { address: e.relayer }
+            }
         );
         try_decode!(
-            RelayerUnfrozenFilter,
-            "RelayerUnfrozen",
-            |e: RelayerUnfrozenFilter| ChainNodeEvent::ProfileChanged { address: e.relayer }
+            NoxRegistry::RelayerUnfrozen,
+            |e: NoxRegistry::RelayerUnfrozen| {
+                ChainNodeEvent::ProfileChanged { address: e.relayer }
+            }
         );
-        try_decode!(UnstakedFilter, "Unstaked", |e: UnstakedFilter| {
+        try_decode!(NoxRegistry::Unstaked, |e: NoxRegistry::Unstaked| {
             ChainNodeEvent::Unstaked {
                 address: e.relayer,
                 amount: e.amount,
@@ -428,34 +531,48 @@ impl ChainConfig {
         None
     }
 
+    /// `eth_call` of a contract view at `block` (latest when `None`).
+    pub async fn view<C: SolCall>(
+        &self,
+        to: Address,
+        call: &C,
+        block: Option<u64>,
+    ) -> Result<C::Return, String> {
+        let output: Bytes = self
+            .client
+            .request(
+                "eth_call",
+                (view_object(to, &call.abi_encode()), block_tag(block)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        C::abi_decode_returns(&output)
+            .map_err(|e| format!("{} returned undecodable data: {e}", C::SIGNATURE))
+    }
+
     /// `relayers(address)` at `block` (latest when `None`), for either registry layout.
     pub async fn fetch_profile(
         &self,
         address: Address,
         block: Option<u64>,
     ) -> Result<RelayerProfile, String> {
-        let tx: TypedTransaction = TransactionRequest::new()
-            .to(self.registry_address)
-            .data(relayers_calldata(address))
-            .into();
-        let block_id = block.map(|n| BlockId::Number(BlockNumber::Number(n.into())));
-        let raw = self
-            .provider
-            .call(&tx, block_id)
+        let object = legacy_call_object(self.registry_address, &relayers_calldata(address));
+        let raw: Bytes = self
+            .client
+            .request("eth_call", (object, block_tag(block)))
             .await
             .map_err(|e| format!("relayers({address:?}) call failed: {e}"))?;
         decode_relayer_profile(&raw).map_err(|e| format!("relayers({address:?}): {e}"))
     }
 
     async fn fetch_role(&self, address: Address, block: Option<u64>) -> Result<u8, String> {
-        let call = self.contract.get_node_role(address);
-        let call = match block {
-            Some(n) => call.block(BlockId::Number(BlockNumber::Number(n.into()))),
-            None => call,
-        };
-        call.call()
-            .await
-            .map_err(|e| format!("getNodeRole({address:?}): {e}"))
+        self.view(
+            self.registry_address,
+            &NoxRegistry::getNodeRoleCall { _relayer: address },
+            block,
+        )
+        .await
+        .map_err(|e| format!("getNodeRole({address:?}): {e}"))
     }
 
     pub async fn fetch_node_info(&self, address: Address) -> Result<Option<OnChainNode>, String> {
@@ -470,7 +587,7 @@ impl ChainConfig {
             url: profile.url,
             ingress_url: profile.ingress_url,
             metadata_url: profile.metadata_url,
-            sphinx_key: ethers::utils::hex::encode(profile.sphinx_key),
+            sphinx_key: alloy::hex::encode(profile.sphinx_key),
             role,
             frozen: profile.frozen,
         }))
@@ -478,22 +595,23 @@ impl ChainConfig {
 
     /// `(relayerCount, topologyFingerprint)` at `block`.
     pub async fn membership_at(&self, block: u64) -> Result<(U256, [u8; 32]), String> {
-        let block_id = BlockId::Number(BlockNumber::Number(block.into()));
         let count = self
-            .contract
-            .relayer_count()
-            .block(block_id)
-            .call()
+            .view(
+                self.registry_address,
+                &NoxRegistry::relayerCountCall {},
+                Some(block),
+            )
             .await
             .map_err(|error| format!("relayerCount at block {block}: {error}"))?;
         let fingerprint = self
-            .contract
-            .topology_fingerprint()
-            .block(block_id)
-            .call()
+            .view(
+                self.registry_address,
+                &NoxRegistry::topologyFingerprintCall {},
+                Some(block),
+            )
             .await
             .map_err(|error| format!("topologyFingerprint at block {block}: {error}"))?;
-        Ok((count, fingerprint))
+        Ok((count, fingerprint.0))
     }
 
     /// Check a replayed member set against the registry's count and fingerprint.
@@ -543,7 +661,7 @@ impl ChainConfig {
                 }
                 let address_text = format!("{address:?}").to_lowercase();
                 Ok(PinnedTopologyNode {
-                    sphinx_key: ethers::utils::hex::encode(profile.sphinx_key),
+                    sphinx_key: alloy::hex::encode(profile.sphinx_key),
                     url: profile.url,
                     ingress_url: profile.ingress_url,
                     metadata_url: profile.metadata_url,
@@ -559,25 +677,25 @@ impl ChainConfig {
             .try_collect()
             .await?;
         nodes.sort_by(|left, right| left.address.cmp(&right.address));
-        Ok((nodes, ethers::utils::hex::encode(fingerprint)))
+        Ok((nodes, alloy::hex::encode(fingerprint)))
     }
 
     /// Timestamp (Unix seconds) of block `block`.
     pub async fn block_timestamp(&self, block: u64) -> Result<u64, String> {
-        let header = self
-            .provider
-            .get_block(block)
+        let header: Option<BlockTimestamp> = self
+            .client
+            .request("eth_getBlockByNumber", (format!("{block:#x}"), false))
             .await
-            .map_err(|e| format!("eth_getBlockByNumber {block}: {e}"))?
-            .ok_or_else(|| format!("block {block} is not available yet"))?;
-        Ok(header.timestamp.low_u64())
+            .map_err(|e| format!("eth_getBlockByNumber {block}: {e}"))?;
+        let header = header.ok_or_else(|| format!("block {block} is not available yet"))?;
+        Ok(header.timestamp.to::<u64>())
     }
 
     pub async fn current_block(&self) -> Result<u64, String> {
-        self.provider
-            .get_block_number()
+        self.client
+            .request_noparams::<U64>("eth_blockNumber")
             .await
-            .map(|n| n.as_u64())
+            .map(|n| n.to::<u64>())
             .map_err(|e| format!("Failed to get block number: {e}"))
     }
 }
@@ -595,7 +713,7 @@ pub fn validate_pinned_membership(
                 "replayed topology has duplicate address {address:?}"
             ));
         }
-        let address_hash = keccak256(address.as_bytes());
+        let address_hash = keccak256(address.as_slice());
         for (accumulator, byte) in fingerprint.iter_mut().zip(address_hash) {
             *accumulator ^= byte;
         }
@@ -652,6 +770,9 @@ pub fn derive_admin_url_with(multiaddr: &str, allow_private: bool) -> String {
     // SocketAddr adds the brackets an IPv6 host needs in a URL.
     format!("http://{}", std::net::SocketAddr::new(ip, admin_port))
 }
+
+#[cfg(test)]
+mod golden;
 
 #[cfg(test)]
 mod tests {
@@ -737,7 +858,7 @@ mod tests {
         assert!(logs.is_empty());
         assert_eq!(end, 150);
         assert_eq!(
-            chain.provider.as_ref().logs_served_by(),
+            chain.transport.logs_served_by(),
             1,
             "the result must come from the endpoint that has reached block 150"
         );
@@ -793,7 +914,7 @@ mod tests {
 
     #[test]
     fn pinned_membership_rejects_a_partial_replay() {
-        let addresses = [Address::from_low_u64_be(1)];
+        let addresses = [Address::with_last_byte(1)];
         let error = validate_pinned_membership(&addresses, U256::from(2), [0_u8; 32])
             .expect_err("a replay missing a registered address must fail closed");
 
@@ -802,8 +923,8 @@ mod tests {
 
     #[test]
     fn pinned_membership_rejects_a_fingerprint_mismatch() {
-        let addresses = [Address::from_low_u64_be(1)];
-        let error = validate_pinned_membership(&addresses, U256::one(), [0_u8; 32])
+        let addresses = [Address::with_last_byte(1)];
+        let error = validate_pinned_membership(&addresses, U256::from(1), [0_u8; 32])
             .expect_err("a replay with the wrong membership fingerprint must fail closed");
 
         assert!(error.contains("fingerprint"));

@@ -6,8 +6,8 @@
 //! a replay is idempotent. After new events (and every few minutes) the
 //! per-exit totals are recomputed and the pool's balances read on chain.
 
-use ethers::contract::{EthEvent, EthLogDecode};
-use ethers::prelude::*;
+use alloy::primitives::{Address, U256};
+use alloy::sol_types::{SolCall, SolEvent};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -15,26 +15,32 @@ use std::time::{Duration, Instant};
 
 use crate::state::AppState;
 
-use super::{retry_rpc, ChainConfig};
+use super::{retry_rpc, ChainConfig, Log, LogFilter};
 
-abigen!(
-    NoxEntryPointEvents,
-    r#"[
-        event PaidExecutionSettled(bytes32 indexed executionId, bytes32 indexed paymentId, address indexed exit, address feeAsset, uint256 exitFee, uint256 networkFee, address actionTarget, bool actionSuccess, uint256 returnDataLength, bytes32 returnPrefixHash)
-    ]"#
-);
+/// Contract bindings. `PaidExecutionSettled` has ten fields, so its generated
+/// constructor takes ten arguments.
+#[allow(clippy::too_many_arguments)]
+mod bindings {
+    use alloy::sol;
 
-abigen!(
-    NoxRewardPoolReader,
-    r#"[
-        event ExitCreditClaimed(address indexed exit, address indexed recipient, address indexed asset, uint256 amount)
-        function claimableExit(address exit, address asset) view returns (uint256)
-        function totalCollected(address asset) view returns (uint256)
-        function totalDistributed(address asset) view returns (uint256)
-        function networkOutstanding(address asset) view returns (uint256)
-        function exitOutstanding(address asset) view returns (uint256)
-    ]"#
-);
+    sol! {
+        interface NoxEntryPointEvents {
+            event PaidExecutionSettled(bytes32 indexed executionId, bytes32 indexed paymentId, address indexed exit, address feeAsset, uint256 exitFee, uint256 networkFee, address actionTarget, bool actionSuccess, uint256 returnDataLength, bytes32 returnPrefixHash);
+        }
+
+        interface NoxRewardPoolReader {
+            event ExitCreditClaimed(address indexed exit, address indexed recipient, address indexed asset, uint256 amount);
+            function claimableExit(address exit, address asset) external view returns (uint256);
+            function totalCollected(address asset) external view returns (uint256);
+            function totalDistributed(address asset) external view returns (uint256);
+            function networkOutstanding(address asset) external view returns (uint256);
+            function exitOutstanding(address asset) external view returns (uint256);
+        }
+    }
+}
+
+use bindings::NoxEntryPointEvents::PaidExecutionSettled;
+use bindings::NoxRewardPoolReader::{self, ExitCreditClaimed};
 
 /// How often new settlement logs are fetched.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -87,16 +93,14 @@ impl SettlementConfig {
         }
     }
 
-    fn filter(&self) -> Filter {
+    pub(crate) fn filter(&self) -> LogFilter {
         let mut addresses = vec![self.entry_point];
-        let mut topics = vec![Some(PaidExecutionSettledFilter::signature())];
+        let mut topics = vec![PaidExecutionSettled::SIGNATURE_HASH];
         if let Some(pool) = self.reward_pool {
             addresses.push(pool);
-            topics.push(Some(ExitCreditClaimedFilter::signature()));
+            topics.push(ExitCreditClaimed::SIGNATURE_HASH);
         }
-        Filter::new()
-            .address(addresses)
-            .topic0(ValueOrArray::Array(topics))
+        LogFilter::events(addresses, topics)
     }
 }
 
@@ -105,7 +109,7 @@ fn hex_address(address: Address) -> String {
 }
 
 fn hex_bytes32(bytes: [u8; 32]) -> String {
-    format!("0x{}", ethers::utils::hex::encode(bytes))
+    format!("0x{}", alloy::hex::encode(bytes))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -165,34 +169,32 @@ pub fn decode_settlement_log(log: &Log, config: &SettlementConfig) -> Option<Set
     if log.removed == Some(true) {
         return None;
     }
-    let topic0 = *log.topics.first()?;
-    let raw = ethers::abi::RawLog {
-        topics: log.topics.clone(),
-        data: log.data.to_vec(),
-    };
+    let topics = &log.topics;
+    let data = &log.data;
+    let topic0 = *topics.first()?;
     let tx_hash = format!("{:?}", log.transaction_hash?);
-    let log_index = log.log_index?.as_u64();
-    let block_number = log.block_number?.as_u64();
+    let log_index = log.log_index?.to::<u64>();
+    let block_number = log.block_number?.to::<u64>();
 
-    if log.address == config.entry_point && topic0 == PaidExecutionSettledFilter::signature() {
-        let event = <PaidExecutionSettledFilter as EthLogDecode>::decode_log(&raw).ok()?;
+    if log.address == config.entry_point && topic0 == PaidExecutionSettled::SIGNATURE_HASH {
+        let event = PaidExecutionSettled::decode_raw_log(topics.iter().copied(), data).ok()?;
         return Some(SettlementLog::Settled(PaidSettlement {
             tx_hash,
             log_index,
             block_number,
             block_timestamp: 0,
-            execution_id: hex_bytes32(event.execution_id),
-            payment_id: hex_bytes32(event.payment_id),
+            execution_id: hex_bytes32(event.executionId.0),
+            payment_id: hex_bytes32(event.paymentId.0),
             exit_address: hex_address(event.exit),
-            fee_asset: hex_address(event.fee_asset),
-            exit_fee: event.exit_fee.to_string(),
-            network_fee: event.network_fee.to_string(),
-            action_target: hex_address(event.action_target),
-            action_success: event.action_success,
+            fee_asset: hex_address(event.feeAsset),
+            exit_fee: event.exitFee.to_string(),
+            network_fee: event.networkFee.to_string(),
+            action_target: hex_address(event.actionTarget),
+            action_success: event.actionSuccess,
         }));
     }
-    if Some(log.address) == config.reward_pool && topic0 == ExitCreditClaimedFilter::signature() {
-        let event = <ExitCreditClaimedFilter as EthLogDecode>::decode_log(&raw).ok()?;
+    if Some(log.address) == config.reward_pool && topic0 == ExitCreditClaimed::SIGNATURE_HASH {
+        let event = ExitCreditClaimed::decode_raw_log(topics.iter().copied(), data).ok()?;
         return Some(SettlementLog::Claimed(ExitCreditClaim {
             tx_hash,
             log_index,
@@ -505,7 +507,7 @@ async fn refresh_summary(
     let mut pool_gauges = Vec::new();
     let mut pool_read_block = None;
     if let (Some(pool), Some(block)) = (config.reward_pool, read_block) {
-        match read_pool_gauges(state, chain, pool, block, &mut exits).await {
+        match read_pool_gauges(&state.shutdown, chain, pool, block, &mut exits).await {
             Ok(gauges) => {
                 pool_gauges = gauges;
                 pool_read_block = Some(block);
@@ -527,31 +529,29 @@ async fn refresh_summary(
 }
 
 /// One `uint256` view call at a pinned block, retried with backoff.
-async fn read_view(
+async fn read_view<C>(
     label: &str,
     shutdown: &tokio_util::sync::CancellationToken,
-    call: ethers::contract::ContractCall<super::RegistryProvider, U256>,
-    at: BlockId,
-) -> Result<String, String> {
-    retry_rpc(label, shutdown, || {
-        let call = call.clone().block(at);
-        async move { call.call().await.map_err(|e| e.to_string()) }
-    })
-    .await
-    .map(|value| value.to_string())
+    chain: &ChainConfig,
+    pool: Address,
+    call: C,
+    block: u64,
+) -> Result<String, String>
+where
+    C: SolCall<Return = U256>,
+{
+    retry_rpc(label, shutdown, || chain.view(pool, &call, Some(block)))
+        .await
+        .map(|value| value.to_string())
 }
 
-async fn read_pool_gauges(
-    state: &AppState,
+pub(crate) async fn read_pool_gauges(
+    shutdown: &tokio_util::sync::CancellationToken,
     chain: &ChainConfig,
     pool: Address,
     block: u64,
     exits: &mut [ExitSettlementTotals],
 ) -> Result<Vec<PoolAssetGauge>, String> {
-    let reader = NoxRewardPoolReader::new(pool, Arc::new(chain.provider.clone()));
-    let at = BlockId::Number(BlockNumber::Number(block.into()));
-    let shutdown = &state.shutdown;
-
     for exit in exits.iter_mut() {
         let (Ok(exit_address), Ok(asset)) = (
             exit.exit_address.parse::<Address>(),
@@ -563,8 +563,13 @@ async fn read_pool_gauges(
             read_view(
                 "claimableExit",
                 shutdown,
-                reader.claimable_exit(exit_address, asset),
-                at,
+                chain,
+                pool,
+                NoxRewardPoolReader::claimableExitCall {
+                    exit: exit_address,
+                    asset,
+                },
+                block,
             )
             .await?,
         );
@@ -580,29 +585,37 @@ async fn read_pool_gauges(
             total_collected: read_view(
                 "totalCollected",
                 shutdown,
-                reader.total_collected(asset),
-                at,
+                chain,
+                pool,
+                NoxRewardPoolReader::totalCollectedCall { asset },
+                block,
             )
             .await?,
             total_distributed: read_view(
                 "totalDistributed",
                 shutdown,
-                reader.total_distributed(asset),
-                at,
+                chain,
+                pool,
+                NoxRewardPoolReader::totalDistributedCall { asset },
+                block,
             )
             .await?,
             network_outstanding: read_view(
                 "networkOutstanding",
                 shutdown,
-                reader.network_outstanding(asset),
-                at,
+                chain,
+                pool,
+                NoxRewardPoolReader::networkOutstandingCall { asset },
+                block,
             )
             .await?,
             exit_outstanding: read_view(
                 "exitOutstanding",
                 shutdown,
-                reader.exit_outstanding(asset),
-                at,
+                chain,
+                pool,
+                NoxRewardPoolReader::exitOutstandingCall { asset },
+                block,
             )
             .await?,
             asset: asset_text,
@@ -624,7 +637,9 @@ mod tests {
             .unwrap()
     }
 
-    fn h256(hex: &str) -> H256 {
+    use alloy::primitives::{B256, U64};
+
+    fn h256(hex: &str) -> B256 {
         hex.parse().unwrap()
     }
 
@@ -647,24 +662,23 @@ mod tests {
                    c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
                 .parse()
                 .unwrap(),
-            block_number: Some(312_421_630_u64.into()),
+            block_number: Some(U64::from(312_421_630_u64)),
             transaction_hash: Some(h256(
                 "0x35c3a974a660991cec78a68125651bf655fb3dbc920d146fd58353ad532315e7",
             )),
-            log_index: Some(17_u64.into()),
+            log_index: Some(U64::from(17_u64)),
             removed: Some(false),
-            ..Log::default()
         }
     }
 
     #[test]
     fn event_signatures_match_the_deployed_contracts() {
         assert_eq!(
-            PaidExecutionSettledFilter::signature(),
+            PaidExecutionSettled::SIGNATURE_HASH,
             h256("0x08999181408049964f922b10eccdf5d39b08dcb8920aac22cd2fc19282d63012")
         );
         assert_eq!(
-            ExitCreditClaimedFilter::signature(),
+            ExitCreditClaimed::SIGNATURE_HASH,
             h256("0x92e0ae99e3f3d04ceee88f4f453b6bffbdfc7625523b73eea93710adab80d4ca")
         );
     }
@@ -728,15 +742,15 @@ mod tests {
         let log = Log {
             address: REWARD_POOL.parse().unwrap(),
             topics: vec![
-                ExitCreditClaimedFilter::signature(),
-                H256::from(exit),
-                H256::from(recipient),
-                H256::from(asset),
+                ExitCreditClaimed::SIGNATURE_HASH,
+                exit.into_word(),
+                recipient.into_word(),
+                asset.into_word(),
             ],
-            data: ethers::abi::encode(&[ethers::abi::Token::Uint(U256::from(5_u64))]).into(),
-            block_number: Some(10_u64.into()),
-            transaction_hash: Some(H256::repeat_byte(1)),
-            log_index: Some(0_u64.into()),
+            data: U256::from(5_u64).to_be_bytes_vec().into(),
+            block_number: Some(U64::from(10_u64)),
+            transaction_hash: Some(B256::repeat_byte(1)),
+            log_index: Some(U64::from(0_u64)),
             ..Log::default()
         };
         let Some(SettlementLog::Claimed(claim)) = decode_settlement_log(&log, &config()) else {
